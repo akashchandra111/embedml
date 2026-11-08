@@ -1,0 +1,35 @@
+build/
+build-*/
+*.o
+*.a
+*.so
+*.dylib
+compile_commands.json
+.cache/
+
+# Generated example artifacts
+examples/iris/iris.elml
+examples/iris/train_output.txt
+examples/iris/run_output.txt
+examples/iris/inspect_output.txt
+examples/iris/mcu/model_blob.h
+examples/iris/mcu/host_check
+examples/wdbc/wdbc.elml
+examples/wdbc/train_output.txt
+examples/wdbc/run_output.txt
+examples/wdbc/inspect_output.txt
+examples/wdbc/repl.jsonl
+examples/wdbc/python_output.txt
+examples/covtype/covtype.data
+examples/covtype/covtype.elml
+examples/covtype/train_output.txt
+examples/covtype/run_output.txt
+examples/covtype/inspect_output.txt
+examples/covtype/predict.json
+examples/covtype/repl_input.csv
+examples/covtype/repl.jsonl
+examples/covtype/python_output.txt
+
+# Test scratch
+tests/cli_work/
+elml_*_??????
