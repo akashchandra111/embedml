@@ -67,6 +67,7 @@ typedef struct elml_training {
   bool stopped;
   bool early_stopped;
   bool exported;
+  bool finalized;
 
   atomic_bool stop_requested;
   char error[256];
@@ -89,6 +90,25 @@ elml_status elml_training_init(elml_training *training,
  */
 elml_status elml_training_run(elml_training *training,
                               elml_train_progress_fn progress, void *user);
+
+/*
+ * Cooperative stepping for hosts that cannot block in a worker thread (the
+ * browser studio). Runs at most one epoch, publishes the same metrics the
+ * progress callback would receive, and finalizes the session (restores the
+ * best weights and computes the final train/validation numbers) on the step
+ * that ends the run.
+ *
+ * `step.done` means no further epochs are available; `step.epoch_completed`
+ * is false when a stop request aborted the epoch before it finished.
+ */
+typedef struct elml_train_step {
+  bool epoch_completed;
+  bool done;
+  elml_train_metrics metrics;
+} elml_train_step;
+
+elml_status elml_training_step_epoch(elml_training *training,
+                                     elml_train_step *step);
 
 /* Ask a running session to stop at the next batch boundary. Thread-safe. */
 void elml_training_request_stop(elml_training *training);

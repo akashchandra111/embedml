@@ -30,7 +30,7 @@ int main(void)
       CHECK_EQ_INT((uintptr_t)read % 64u, 0u);
       CHECK(memcmp(read, data, sizeof data) == 0);
     }
-    free(read);
+    elml_aligned_free(read);
 
     CHECK_EQ_INT(elml_read_file(path, &read, &len, 0u), ELML_OK);
     CHECK(read != NULL);

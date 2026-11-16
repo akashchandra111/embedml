@@ -32,6 +32,8 @@ This is the v1 milestone. Implemented:
   model once and reuses it for every question.
 * An optional CUI desktop studio for editing training parameters and watching
   loss and accuracy update live.
+* An optional WebAssembly build of the same studio, served as static files and
+  trained cooperatively in the page.
 
 Not yet implemented, and explicitly rejected rather than silently ignored:
 
@@ -49,6 +51,7 @@ src/format/          on-disk parser, writer, CRC32, inspect helpers
 src/kernels/         common dispatch/scalar plus x86_64, arm64, and riscv kernels
 src/train/           host-only trainer: CSV, INI, config, dataset, net, session, export
 src/studio/          optional CUI desktop frontend for the trainer
+wasm/                browser build: build script, page glue, Node smoke test
 src/run/             elml_run command-line inference/evaluation tool
 tools/               elml_inspect
 examples/iris/       end-to-end example, including an MCU-style demo
@@ -79,6 +82,7 @@ Useful options:
 | `ELML_SIMD` | `ON` | Build the kernel for the target architecture (x86_64 AVX2/FMA, arm64 NEON, RISC-V RVV) |
 | `ELML_STRICT_FP` | `OFF` | Force the scalar f32 path |
 | `ELML_BUILD_STUDIO` | `OFF` | Build the CUI desktop training studio |
+| `ELML_BUILD_WEB` | `OFF` | Build the WebAssembly studio and register its Node smoke test |
 | `ELML_CUI_SOURCE_DIR` | empty | Use a local CUI checkout instead of the `third_party/CUI` submodule |
 | `ELML_MAX_LAYERS` | `64` | Maximum layers per model |
 | `ELML_MAX_RANK` | `4` | Maximum tensor rank |
@@ -100,6 +104,7 @@ Architecture-specific code lives under `src/kernels/<arch>/`:
 | x86_64 | `x86_64/simd_f32.c` | AVX2 + FMA, runtime-dispatched (no AVX2 requirement for the rest of the binary) |
 | arm64 | `arm64/neon_f32.c` | NEON (baseline on AArch64) |
 | RISC-V | `riscv/vector_f32.c` | RVV 1.0, built when the toolchain defines `__riscv_vector` |
+| wasm32 | `wasm/simd128_f32.c` | SIMD128, built when the target defines `__wasm_simd128__` |
 | any | `common/scalar_f32.c` | Portable scalar fallback and reference |
 
 `kernels/common/dispatch.c` selects the implementation. Training and inference
@@ -232,6 +237,52 @@ automatically when training finishes or early-stops.
 The window only redraws when it has something to show: animations and hover
 effects run at full speed, an active run refreshes at a readable pace, and an
 idle window drops to a slow tick so it stays near 0% CPU.
+
+## Browser studio (WebAssembly)
+
+The same studio also builds for the browser with plain `clang --target=wasm32`
+and `wasm-ld`. There is no Emscripten and no downloaded sysroot: the build reuses
+CUI's tiny wasm shim and its software renderer, then links the same
+`elml_train_lib` sources as the desktop app. JavaScript only loads the module,
+copies pixels to a canvas, forwards input, and moves files in and out.
+
+```sh
+git submodule update --init --recursive
+./wasm/build.sh          # writes build-web/elml_studio.wasm and the page
+./wasm/serve.sh          # http://127.0.0.1:8765
+```
+
+Or let CMake drive it:
+
+```sh
+cmake -S . -B build-web -DELML_BUILD_WEB=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-web -j
+ctest --test-dir build-web -R wasm_studio --output-on-failure
+```
+
+The page preloads `samples/iris.ini` and `samples/iris.csv`; use **Load iris
+sample** to bring them back after replacing them, or pick files with the hidden
+inputs in the Files panel. Every Browse button inside the canvas asks the page
+for a file, so the browser's file picker replaces the native dialog.
+
+Training in the browser is cooperative: with no threads available, the studio
+runs **one epoch per animation frame** through `elml_training_step_epoch()`.
+Stop requests are still honoured at batch boundaries, the best epoch is
+restored, and the exported `.elml` model lands in an in-memory file table
+(`src/train/memfs.c`). The Files panel lists that table and can download any
+entry, including predictions saved from the Evaluate tab.
+
+WebAssembly SIMD128 kernels are enabled by default (`src/kernels/wasm/`). Build
+the scalar path instead with:
+
+```sh
+ELML_WASM_SIMD=0 ./wasm/build.sh
+```
+
+`wasm/test.mjs` is the Node smoke test: it loads the module, registers the iris
+sample, drives one frame per epoch, checks the export, and evaluates the model.
+It needs no browser and no test framework. `ELML_WEB_OUT` and `PORT` choose a
+different output directory or server port.
 
 ## Single-row prediction
 

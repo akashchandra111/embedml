@@ -184,114 +184,12 @@ fail:
   return status;
 }
 
-elml_status elml_training_run(elml_training *training,
-                              elml_train_progress_fn progress, void *user)
+static void elml_training_finalize(elml_training *training)
 {
-  if (training == nullptr || !training->prepared) {
-    return ELML_ERR_INVALID_ARG;
+  if (training->finalized) {
+    return;
   }
-
-  const elml_config *config = &training->config;
-  const elml_dataset *monitor =
-      (training->val.rows > 0u) ? &training->val : &training->train;
-  const bool has_accuracy = (monitor->class_index != nullptr);
-  elml_status status = ELML_OK;
-
-  for (uint32_t epoch = training->epochs_done + 1u; epoch <= config->epochs;
-       ++epoch) {
-    elml_shuffle_order(training->order, training->train.rows,
-                       &training->rng_state);
-
-    bool aborted = false;
-    for (uint32_t start = 0u; start < training->train.rows;
-         start += config->batch) {
-      if (atomic_load(&training->stop_requested)) {
-        aborted = true;
-        break;
-      }
-
-      uint32_t count = config->batch;
-      if (count > training->train.rows - start) {
-        count = training->train.rows - start;
-      }
-      elml_net_zero_grad(&training->net);
-      for (uint32_t k = 0u; k < count; ++k) {
-        if (atomic_load(&training->stop_requested)) {
-          aborted = true;
-          break;
-        }
-        const uint32_t row = training->order[start + k];
-        const float *input =
-            &training->train.x[(size_t)row * training->train.input_dim];
-        const float *target =
-            &training->train.y[(size_t)row * training->train.output_dim];
-        const uint32_t class_index =
-            (training->train.class_index != nullptr)
-                ? training->train.class_index[row]
-                : 0u;
-        status = elml_net_accumulate(&training->net, input, target,
-                                     class_index);
-        if (status != ELML_OK) {
-          elml_training_error(training, "training failed: %s",
-                              elml_error_string(status));
-          return status;
-        }
-      }
-      if (aborted) {
-        break;
-      }
-      elml_net_update(&training->net, count);
-    }
-    if (aborted) {
-      training->stopped = true;
-      break;
-    }
-
-    uint32_t correct = 0u;
-    const float monitor_loss =
-        elml_net_evaluate(&training->net, monitor, &correct);
-    bool improved = false;
-    if (monitor_loss < training->best_loss - 1e-6f) {
-      training->best_loss = monitor_loss;
-      training->best_epoch = epoch;
-      training->stale = 0u;
-      elml_net_save_best(&training->net);
-      improved = true;
-    } else {
-      training->stale++;
-    }
-
-    training->epochs_done = epoch;
-
-    elml_train_metrics metrics = {
-        .epoch = epoch,
-        .epochs = config->epochs,
-        .best_epoch = training->best_epoch,
-        .train_rows = training->train.rows,
-        .val_rows = training->val.rows,
-        .loss = monitor_loss,
-        .accuracy =
-            (has_accuracy && monitor->rows > 0u)
-                ? (float)((double)correct / (double)monitor->rows)
-                : 0.0f,
-        .has_accuracy = has_accuracy,
-        .improved = improved,
-        .early_stopped = false,
-        .stopped = false,
-    };
-
-    if (config->early_stop > 0u && training->stale >= config->early_stop) {
-      training->early_stopped = true;
-      metrics.early_stopped = true;
-    }
-    if (progress != nullptr) {
-      progress(&metrics, user);
-    }
-    if (metrics.early_stopped) {
-      break;
-    }
-  }
-
+  training->finalized = true;
   if (atomic_load(&training->stop_requested)) {
     training->stopped = true;
   }
@@ -316,8 +214,146 @@ elml_status elml_training_run(elml_training *training,
           (float)((double)correct / (double)training->val.rows);
     }
   }
+}
 
+elml_status elml_training_step_epoch(elml_training *training,
+                                     elml_train_step *step)
+{
+  if (training == nullptr || step == nullptr || !training->prepared) {
+    return ELML_ERR_INVALID_ARG;
+  }
+  memset(step, 0, sizeof *step);
+
+  const elml_config *config = &training->config;
+  if (training->finalized || training->epochs_done >= config->epochs) {
+    elml_training_finalize(training);
+    step->done = true;
+    return ELML_OK;
+  }
+
+  const elml_dataset *monitor =
+      (training->val.rows > 0u) ? &training->val : &training->train;
+  const bool has_accuracy = (monitor->class_index != nullptr);
+  const uint32_t epoch = training->epochs_done + 1u;
+
+  elml_shuffle_order(training->order, training->train.rows,
+                     &training->rng_state);
+
+  bool aborted = false;
+  for (uint32_t start = 0u; start < training->train.rows;
+       start += config->batch) {
+    if (atomic_load(&training->stop_requested)) {
+      aborted = true;
+      break;
+    }
+
+    uint32_t count = config->batch;
+    if (count > training->train.rows - start) {
+      count = training->train.rows - start;
+    }
+    elml_net_zero_grad(&training->net);
+    for (uint32_t k = 0u; k < count; ++k) {
+      if (atomic_load(&training->stop_requested)) {
+        aborted = true;
+        break;
+      }
+      const uint32_t row = training->order[start + k];
+      const float *input =
+          &training->train.x[(size_t)row * training->train.input_dim];
+      const float *target =
+          &training->train.y[(size_t)row * training->train.output_dim];
+      const uint32_t class_index =
+          (training->train.class_index != nullptr)
+              ? training->train.class_index[row]
+              : 0u;
+      const elml_status status = elml_net_accumulate(
+          &training->net, input, target, class_index);
+      if (status != ELML_OK) {
+        elml_training_error(training, "training failed: %s",
+                            elml_error_string(status));
+        return status;
+      }
+    }
+    if (aborted) {
+      break;
+    }
+    elml_net_update(&training->net, count);
+  }
+  if (aborted) {
+    training->stopped = true;
+    elml_training_finalize(training);
+    step->done = true;
+    return ELML_OK;
+  }
+
+  uint32_t correct = 0u;
+  const float monitor_loss =
+      elml_net_evaluate(&training->net, monitor, &correct);
+  bool improved = false;
+  if (monitor_loss < training->best_loss - 1e-6f) {
+    training->best_loss = monitor_loss;
+    training->best_epoch = epoch;
+    training->stale = 0u;
+    elml_net_save_best(&training->net);
+    improved = true;
+  } else {
+    training->stale++;
+  }
+
+  training->epochs_done = epoch;
+
+  elml_train_metrics metrics = {
+      .epoch = epoch,
+      .epochs = config->epochs,
+      .best_epoch = training->best_epoch,
+      .train_rows = training->train.rows,
+      .val_rows = training->val.rows,
+      .loss = monitor_loss,
+      .accuracy =
+          (has_accuracy && monitor->rows > 0u)
+              ? (float)((double)correct / (double)monitor->rows)
+              : 0.0f,
+      .has_accuracy = has_accuracy,
+      .improved = improved,
+      .early_stopped = false,
+      .stopped = false,
+  };
+
+  if (config->early_stop > 0u && training->stale >= config->early_stop) {
+    training->early_stopped = true;
+    metrics.early_stopped = true;
+  }
+
+  step->epoch_completed = true;
+  step->metrics = metrics;
+
+  if (metrics.early_stopped || training->epochs_done >= config->epochs) {
+    elml_training_finalize(training);
+    step->done = true;
+  }
   return ELML_OK;
+}
+
+elml_status elml_training_run(elml_training *training,
+                              elml_train_progress_fn progress, void *user)
+{
+  if (training == nullptr || !training->prepared) {
+    return ELML_ERR_INVALID_ARG;
+  }
+
+  for (;;) {
+    elml_train_step step;
+    const elml_status status = elml_training_step_epoch(training, &step);
+    if (status != ELML_OK) {
+      return status;
+    }
+    if (step.epoch_completed && progress != nullptr) {
+      progress(&step.metrics, user);
+    }
+    if (step.done) {
+      return ELML_OK;
+    }
+  }
 }
 
 void elml_training_request_stop(elml_training *training)

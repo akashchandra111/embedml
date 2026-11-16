@@ -5,9 +5,96 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "elml/arena.h"
 #include "elml/types.h"
+#include "train/memfs.h"
+
+void *elml_aligned_alloc(size_t alignment, size_t size)
+{
+  if (alignment == 0u || (alignment & (alignment - 1u)) != 0u) {
+    return nullptr;
+  }
+  const size_t header = sizeof(void *);
+  if (size > SIZE_MAX - header - alignment) {
+    return nullptr;
+  }
+  void *raw = malloc(size + header + alignment);
+  if (raw == nullptr) {
+    return nullptr;
+  }
+  const uintptr_t base = (uintptr_t)raw + (uintptr_t)header;
+  const uintptr_t aligned =
+      (base + (uintptr_t)alignment - 1u) & ~((uintptr_t)alignment - 1u);
+  void *result = (void *)aligned;
+  ((void **)result)[-1] = raw;
+  return result;
+}
+
+void elml_aligned_free(void *ptr)
+{
+  if (ptr == nullptr) {
+    return;
+  }
+  free(((void **)ptr)[-1]);
+}
+
+#if defined(ELML_WASM)
+
+elml_status elml_read_file(const char *path, uint8_t **data, size_t *len,
+                           size_t alignment)
+{
+  if (path == nullptr || data == nullptr || len == nullptr) {
+    return ELML_ERR_INVALID_ARG;
+  }
+  if (alignment != 0u && (alignment & (alignment - 1u)) != 0u) {
+    return ELML_ERR_INVALID_ARG;
+  }
+  *data = nullptr;
+  *len = 0u;
+
+  const uint8_t *source = nullptr;
+  size_t size = 0u;
+  if (!elml_memfs_get(path, &source, &size)) {
+    return ELML_ERR_NOT_FOUND;
+  }
+  if (size == 0u) {
+    return ELML_ERR_TRUNCATED;
+  }
+
+  uint8_t *buffer;
+  if (alignment == 0u) {
+    buffer = (uint8_t *)malloc(size);
+  } else {
+    const size_t capacity = elml_align_up(size, alignment);
+    if (capacity == 0u) {
+      return ELML_ERR_OUT_OF_MEMORY;
+    }
+    buffer = (uint8_t *)elml_aligned_alloc(alignment, capacity);
+  }
+  if (buffer == nullptr) {
+    return ELML_ERR_OUT_OF_MEMORY;
+  }
+  memcpy(buffer, source, size);
+
+  *data = buffer;
+  *len = size;
+  return ELML_OK;
+}
+
+elml_status elml_write_file(const char *path, const void *data, size_t len)
+{
+  if (path == nullptr || (data == nullptr && len > 0u)) {
+    return ELML_ERR_INVALID_ARG;
+  }
+  if (!elml_memfs_put(path, data, len)) {
+    return ELML_ERR_OUT_OF_MEMORY;
+  }
+  return ELML_OK;
+}
+
+#else /* host: ordinary stdio */
 
 elml_status elml_read_file(const char *path, uint8_t **data, size_t *len,
                            size_t alignment)
@@ -53,7 +140,7 @@ elml_status elml_read_file(const char *path, uint8_t **data, size_t *len,
       fclose(file);
       return ELML_ERR_OUT_OF_MEMORY;
     }
-    buffer = (uint8_t *)aligned_alloc(alignment, capacity);
+    buffer = (uint8_t *)elml_aligned_alloc(alignment, capacity);
   }
   if (buffer == nullptr) {
     fclose(file);
@@ -63,7 +150,11 @@ elml_status elml_read_file(const char *path, uint8_t **data, size_t *len,
   const size_t read = fread(buffer, 1u, size, file);
   fclose(file);
   if (read != size) {
-    free(buffer);
+    if (alignment == 0u) {
+      free(buffer);
+    } else {
+      elml_aligned_free(buffer);
+    }
     return ELML_ERR_TRUNCATED;
   }
 
@@ -92,3 +183,5 @@ elml_status elml_write_file(const char *path, const void *data, size_t len)
   }
   return ELML_OK;
 }
+
+#endif /* ELML_WASM */

@@ -283,7 +283,7 @@ static elml_status eval_rows(const elml_eval_options *options,
   const size_t scratch_bytes =
       elml_align_up(elml_scratch_bytes(&result->model, 1u), ELML_TENSOR_ALIGN);
 
-  void *scratch = aligned_alloc(ELML_TENSOR_ALIGN, scratch_bytes);
+  void *scratch = elml_aligned_alloc(ELML_TENSOR_ALIGN, scratch_bytes);
   float *input = (float *)malloc((size_t)input_dim * sizeof *input);
   float *prediction = (float *)malloc((size_t)output_dim * sizeof *prediction);
   float *target_buffer = nullptr;
@@ -301,7 +301,7 @@ static elml_status eval_rows(const elml_eval_options *options,
       result->values == nullptr || result->rows == nullptr ||
       (result->scored && result->targets == nullptr) ||
       (result->scored && !result->classification && target_buffer == nullptr)) {
-    free(scratch);
+    elml_aligned_free(scratch);
     free(input);
     free(prediction);
     free(target_buffer);
@@ -434,7 +434,7 @@ static elml_status eval_rows(const elml_eval_options *options,
     result->mae = abs_sum / (double)loss_count;
   }
 
-  free(scratch);
+  elml_aligned_free(scratch);
   free(input);
   free(prediction);
   free(target_buffer);
@@ -521,11 +521,70 @@ void elml_eval_free(elml_eval_result *result)
   free(result->target_columns);
   free(result->input_columns);
   elml_csv_free(&result->csv);
-  free(result->blob);
+  elml_aligned_free(result->blob);
   memset(result, 0, sizeof *result);
 }
 
-static void eval_write_field(FILE *file, const char *text, char delimiter)
+/*
+ * The prediction file is assembled in memory and then handed to
+ * elml_write_file(). That keeps the writer identical on the host and in the
+ * browser, where stdio has no file system behind it.
+ */
+typedef struct eval_sink {
+  char *data;
+  size_t len;
+  size_t cap;
+  bool failed;
+} eval_sink;
+
+static bool eval_sink_reserve(eval_sink *sink, size_t extra)
+{
+  if (sink->failed) {
+    return false;
+  }
+  if (extra > SIZE_MAX - sink->len) {
+    sink->failed = true;
+    return false;
+  }
+  const size_t needed = sink->len + extra;
+  if (needed <= sink->cap) {
+    return true;
+  }
+  size_t next = (sink->cap == 0u) ? 4096u : sink->cap;
+  while (next < needed) {
+    if (next > SIZE_MAX / 2u) {
+      next = needed;
+      break;
+    }
+    next *= 2u;
+  }
+  char *grown = (char *)realloc(sink->data, next);
+  if (grown == nullptr) {
+    sink->failed = true;
+    return false;
+  }
+  sink->data = grown;
+  sink->cap = next;
+  return true;
+}
+
+static void eval_sink_putc(eval_sink *sink, char c)
+{
+  if (eval_sink_reserve(sink, 1u)) {
+    sink->data[sink->len++] = c;
+  }
+}
+
+static void eval_sink_puts(eval_sink *sink, const char *text)
+{
+  const size_t length = strlen(text);
+  if (eval_sink_reserve(sink, length)) {
+    memcpy(sink->data + sink->len, text, length);
+    sink->len += length;
+  }
+}
+
+static void eval_write_field(eval_sink *sink, const char *text, char delimiter)
 {
   bool needs_quotes = false;
   for (const char *cursor = text; *cursor != '\0'; ++cursor) {
@@ -536,17 +595,17 @@ static void eval_write_field(FILE *file, const char *text, char delimiter)
     }
   }
   if (!needs_quotes) {
-    fputs(text, file);
+    eval_sink_puts(sink, text);
     return;
   }
-  fputc('"', file);
+  eval_sink_putc(sink, '"');
   for (const char *cursor = text; *cursor != '\0'; ++cursor) {
     if (*cursor == '"') {
-      fputc('"', file);
+      eval_sink_putc(sink, '"');
     }
-    fputc(*cursor, file);
+    eval_sink_putc(sink, *cursor);
   }
-  fputc('"', file);
+  eval_sink_putc(sink, '"');
 }
 
 elml_status elml_eval_write_csv(const elml_eval_result *result,
@@ -555,10 +614,7 @@ elml_status elml_eval_write_csv(const elml_eval_result *result,
   if (result == nullptr || path == nullptr || result->rows == nullptr) {
     return ELML_ERR_INVALID_ARG;
   }
-  FILE *file = fopen(path, "wb");
-  if (file == nullptr) {
-    return ELML_ERR_INTERNAL;
-  }
+  eval_sink sink = {0};
 
   const char delimiter = result->delimiter;
   const uint32_t output_dim = result->output_dim;
@@ -567,31 +623,31 @@ elml_status elml_eval_write_csv(const elml_eval_result *result,
   if (result->has_header) {
     for (uint32_t col = 0u; col < result->csv.cols; ++col) {
       if (col > 0u) {
-        fputc(delimiter, file);
+        eval_sink_putc(&sink, delimiter);
       }
       const char *name = elml_csv_cell(&result->csv, 0u, col);
-      eval_write_field(file, (name != nullptr) ? name : "", delimiter);
+      eval_write_field(&sink, (name != nullptr) ? name : "", delimiter);
     }
     char label[128];
     if (label_count > 0u) {
-      fputc(delimiter, file);
-      eval_write_field(file, "prediction", delimiter);
+      eval_sink_putc(&sink, delimiter);
+      eval_write_field(&sink, "prediction", delimiter);
       for (uint32_t i = 0u; i < label_count; ++i) {
         char column[160];
         snprintf(column, sizeof column, "prob_%s",
                  elml_eval_class_label(&result->model, i, label, sizeof label));
-        fputc(delimiter, file);
-        eval_write_field(file, column, delimiter);
+        eval_sink_putc(&sink, delimiter);
+        eval_write_field(&sink, column, delimiter);
       }
     } else {
       for (uint32_t o = 0u; o < output_dim; ++o) {
         char column[64];
         snprintf(column, sizeof column, "pred_%u", o);
-        fputc(delimiter, file);
-        eval_write_field(file, column, delimiter);
+        eval_sink_putc(&sink, delimiter);
+        eval_write_field(&sink, column, delimiter);
       }
     }
-    fputc('\n', file);
+    eval_sink_putc(&sink, '\n');
   }
 
   for (uint32_t r = 0u; r < result->row_count; ++r) {
@@ -599,40 +655,42 @@ elml_status elml_eval_write_csv(const elml_eval_result *result,
     const uint32_t csv_row = row->line - 1u;
     for (uint32_t col = 0u; col < result->csv.cols; ++col) {
       if (col > 0u) {
-        fputc(delimiter, file);
+        eval_sink_putc(&sink, delimiter);
       }
       const char *cell = elml_csv_cell(&result->csv, csv_row, col);
-      eval_write_field(file, (cell != nullptr) ? cell : "", delimiter);
+      eval_write_field(&sink, (cell != nullptr) ? cell : "", delimiter);
     }
 
     const float *values = elml_eval_values(result, r);
     if (label_count > 0u) {
       char label[128];
-      fputc(delimiter, file);
-      eval_write_field(file,
+      eval_sink_putc(&sink, delimiter);
+      eval_write_field(&sink,
                        elml_eval_class_label(&result->model, row->predicted,
                                              label, sizeof label),
                        delimiter);
       for (uint32_t i = 0u; i < label_count; ++i) {
         char value[64];
         snprintf(value, sizeof value, "%.6f", (double)values[i]);
-        fputc(delimiter, file);
-        eval_write_field(file, value, delimiter);
+        eval_sink_putc(&sink, delimiter);
+        eval_write_field(&sink, value, delimiter);
       }
     } else {
       for (uint32_t o = 0u; o < output_dim; ++o) {
         char value[64];
         snprintf(value, sizeof value, "%.6f", (double)values[o]);
-        fputc(delimiter, file);
-        eval_write_field(file, value, delimiter);
+        eval_sink_putc(&sink, delimiter);
+        eval_write_field(&sink, value, delimiter);
       }
     }
-    fputc('\n', file);
+    eval_sink_putc(&sink, '\n');
   }
 
-  const bool failed = ferror(file) != 0;
-  if (fclose(file) != 0 || failed) {
-    return ELML_ERR_INTERNAL;
+  if (sink.failed) {
+    free(sink.data);
+    return ELML_ERR_OUT_OF_MEMORY;
   }
-  return ELML_OK;
+  const elml_status status = elml_write_file(path, sink.data, sink.len);
+  free(sink.data);
+  return status;
 }

@@ -16,6 +16,8 @@ option(ELML_BUILD_EXAMPLES "Register the examples with CTest" ON)
 option(ELML_SIMD "Use architecture-specific SIMD kernels when available" ON)
 option(ELML_STRICT_FP "Force the scalar f32 path for reproducible results" OFF)
 option(ELML_BUILD_STUDIO "Build the CUI training studio (uses the CUI submodule)" OFF)
+option(ELML_BUILD_WEB "Build the WebAssembly studio and run its Node smoke test" OFF)
+set(ELML_WEB_JOBS "" CACHE STRING "Parallel compile jobs for the wasm build (default: nproc)")
 set(ELML_CUI_SOURCE_DIR "" CACHE PATH "Local CUI checkout instead of the submodule (optional)")
 set(ELML_MAX_LAYERS "64" CACHE STRING "Maximum number of layers per model")
 set(ELML_MAX_RANK "4" CACHE STRING "Maximum tensor rank")
@@ -95,6 +97,7 @@ if(ELML_TRAIN)
     src/train/csv.c
     src/train/ini.c
     src/train/io.c
+    src/train/memfs.c
     src/train/config.c
     src/train/dataset.c
     src/train/net.c
@@ -171,4 +174,51 @@ if(ELML_BUILD_STUDIO)
   target_compile_options(elml_studio PRIVATE ${ELML_WARNINGS})
   target_compile_definitions(elml_studio PRIVATE
     ELML_STUDIO_EXAMPLE_CONFIG="${CMAKE_CURRENT_SOURCE_DIR}/examples/iris/iris.ini")
+endif()
+
+if(ELML_BUILD_WEB)
+  if(NOT ELML_TRAIN)
+    message(FATAL_ERROR "ELML_BUILD_WEB requires ELML_TRAIN=ON")
+  endif()
+
+  # The browser build uses plain clang with the wasm32 target (no Emscripten)
+  # and Node for the smoke test. Skip quietly when the tools are missing.
+  find_program(ELML_WEB_CLANG NAMES clang)
+  find_program(ELML_WEB_WASM_LD NAMES wasm-ld)
+  find_program(ELML_WEB_LLVM_AR NAMES llvm-ar)
+  find_program(ELML_WEB_NODE NAMES node)
+  if(NOT ELML_WEB_CLANG OR NOT ELML_WEB_WASM_LD OR NOT ELML_WEB_LLVM_AR
+     OR NOT ELML_WEB_NODE)
+    message(WARNING
+      "ELML_BUILD_WEB=ON but clang, wasm-ld, llvm-ar and node are not all "
+      "available; the browser build is disabled.")
+  else()
+    set(ELML_WEB_OUT "${CMAKE_CURRENT_BINARY_DIR}/web")
+    if(NOT ELML_WEB_JOBS)
+      set(ELML_WEB_JOBS "${CMAKE_BUILD_PARALLEL_LEVEL}")
+      if(NOT ELML_WEB_JOBS)
+        cmake_host_system_information(RESULT ELML_WEB_JOBS QUERY NUMBER_OF_LOGICAL_CORES)
+      endif()
+    endif()
+
+    set(ELML_WEB_ENV
+      "CC=${ELML_WEB_CLANG}"
+      "WASM_LD=${ELML_WEB_WASM_LD}"
+      "LLVM_AR=${ELML_WEB_LLVM_AR}"
+      "ELML_WEB_OUT=${ELML_WEB_OUT}"
+      "JOBS=${ELML_WEB_JOBS}")
+
+    add_custom_target(elml_web ALL
+      COMMAND ${CMAKE_COMMAND} -E env ${ELML_WEB_ENV}
+              ${CMAKE_CURRENT_SOURCE_DIR}/wasm/build.sh
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      COMMENT "Building the WebAssembly studio (build/web)")
+
+    enable_testing()
+    add_test(NAME wasm_studio
+      COMMAND ${CMAKE_COMMAND} -E env ${ELML_WEB_ENV}
+              ${CMAKE_CURRENT_SOURCE_DIR}/wasm/ctest.sh "${ELML_WEB_NODE}"
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    set_tests_properties(wasm_studio PROPERTIES TIMEOUT 600)
+  endif()
 endif()

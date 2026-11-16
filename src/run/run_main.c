@@ -666,7 +666,7 @@ static int elml_run_load_model(const char *path, uint8_t **blob,
   if (status != ELML_OK) {
     fprintf(stderr, "elml_run: cannot load model: %s\n",
             elml_error_string(status));
-    free(*blob);
+    elml_aligned_free(*blob);
     *blob = nullptr;
     return 1;
   }
@@ -677,7 +677,7 @@ static int elml_run_load_model(const char *path, uint8_t **blob,
     fprintf(stderr,
             "elml_run: model metadata lists %u labels for %u outputs\n",
             label_count, output_dim);
-    free(*blob);
+    elml_aligned_free(*blob);
     *blob = nullptr;
     return 1;
   }
@@ -759,11 +759,11 @@ int main(int argc, char **argv)
 
   if (options.repl) {
     const int exit_code = elml_run_repl(&model, &options);
-    free(blob);
+    elml_aligned_free(blob);
     return exit_code;
   }
 
   const int exit_code = elml_run_predict(&model, &options);
-  free(blob);
+  elml_aligned_free(blob);
   return exit_code;
 }

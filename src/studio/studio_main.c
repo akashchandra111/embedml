@@ -15,8 +15,13 @@
 #include <cui/cui_app.h>
 #include <cui/cui_icons.h>
 
-#include <pthread.h>
 #include <time.h>
+
+#if defined(ELML_WASM)
+#include "train/memfs.h"
+#else
+#include <pthread.h>
+#endif
 
 #include <ctype.h>
 #include <errno.h>
@@ -45,6 +50,16 @@
 #define STUDIO_LIST_MAX ELML_CONFIG_LIST_MAX
 #define STUDIO_HISTORY_MAX 8192
 #define STUDIO_ARG_MAX 48
+
+#if defined(ELML_WASM)
+#define STUDIO_EXPORT(name) __attribute__((export_name(#name)))
+/* web/host/web_app.c calls this after the recorder boots. */
+int web_app_main(void);
+/* Opens an HTML file input; the page calls elml_studio_set_file() with the
+ * bytes once the user picks one. */
+void js_studio_pick_file(int kind)
+    __attribute__((import_module("env"), import_name("js_studio_pick_file")));
+#endif
 
 typedef struct studio_snapshot {
   bool prepared;
@@ -102,11 +117,26 @@ typedef struct studio_columns {
   char status[512];
 } studio_columns;
 
+#if defined(ELML_WASM)
+typedef struct studio_mutex {
+  int unused;
+} studio_mutex;
+#else
+typedef pthread_mutex_t studio_mutex;
+#endif
+
 typedef struct studio_state {
   cui_app *app;
-  pthread_mutex_t mutex;
+  cui_ctx *ui;
+  studio_mutex mutex;
+#if !defined(ELML_WASM)
   pthread_t worker;
+#endif
   bool worker_started;
+
+  /* Cooperative training job (wasm only): one epoch per frame. */
+  elml_training web_training;
+  bool web_job_active;
 
   bool running;
   bool finished;
@@ -160,7 +190,9 @@ typedef struct studio_state {
   bool eval_running;       /* guarded by the mutex */
   bool eval_pending;       /* guarded by the mutex: staging holds a result */
   bool eval_seed_export;   /* guarded by the mutex: copy the exported path */
+#if !defined(ELML_WASM)
   pthread_t eval_worker;
+#endif
   bool eval_join_needed;
 
   elml_eval_result eval_result;   /* UI thread only */
@@ -180,6 +212,13 @@ typedef struct studio_state {
 static float studio_draw_loss[STUDIO_HISTORY_MAX];
 static float studio_draw_accuracy[STUDIO_HISTORY_MAX];
 
+/* The CUI context changes per backend: a window on the host, the page's
+ * canvas instance in the browser. Every redraw request goes through here. */
+static cui_ctx *studio_ui(studio_state *state)
+{
+  return state->ui;
+}
+
 static const char *const studio_activation_labels[] = {
     "ReLU", "Leaky ReLU", "Tanh", "Sigmoid", "Linear"};
 static const char *const studio_activation_values[] = {
@@ -195,6 +234,17 @@ static const char *const studio_missing_values[] = {"error", "zero", "mean"};
 
 #define STUDIO_COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
+#if defined(ELML_WASM)
+static void studio_lock(studio_state *state)
+{
+  (void)state;
+}
+
+static void studio_unlock(studio_state *state)
+{
+  (void)state;
+}
+#else
 static void studio_lock(studio_state *state)
 {
   (void)pthread_mutex_lock(&state->mutex);
@@ -204,6 +254,7 @@ static void studio_unlock(studio_state *state)
 {
   (void)pthread_mutex_unlock(&state->mutex);
 }
+#endif
 
 static bool studio_is_running(studio_state *state)
 {
@@ -229,6 +280,7 @@ static bool studio_eval_running(studio_state *state)
  * hover fades and tooltips run at full speed, give a run its epoch cadence,
  * and tick slowly when the window has nothing to show.
  */
+#if !defined(ELML_WASM)
 #define STUDIO_IDLE_TICK_MS 33L
 #define STUDIO_RUN_TICK_MS 30L
 #define STUDIO_ACTIVE_HOLD_S 0.6
@@ -265,6 +317,7 @@ static void studio_pace(cui_ctx *ui, bool running, double *active_until)
   }
   studio_sleep_ms(STUDIO_IDLE_TICK_MS);
 }
+#endif /* !ELML_WASM */
 
 [[gnu::format(printf, 2, 3)]]
 static void studio_set_error(studio_state *state, const char *format, ...)
@@ -1277,11 +1330,9 @@ static void studio_progress(const elml_train_metrics *metrics, void *user)
   studio_unlock(state);
 }
 
-static void *studio_worker(void *user)
+static bool studio_job_prepare(studio_state *state, elml_training *training)
 {
-  studio_state *state = (studio_state *)user;
-  elml_training training;
-  elml_status status = elml_training_init(&training, &state->pending);
+  const elml_status status = elml_training_init(training, &state->pending);
 
   if (status != ELML_OK) {
     studio_lock(state);
@@ -1289,66 +1340,69 @@ static void *studio_worker(void *user)
     state->running = false;
     state->finished = true;
     snprintf(state->snap.error, sizeof state->snap.error, "%s",
-             (training.error[0] != '\0') ? training.error
-                                         : elml_error_string(status));
+             (training->error[0] != '\0') ? training->error
+                                          : elml_error_string(status));
     snprintf(state->snap.status, sizeof state->snap.status, "%s",
              "Could not prepare the training data.");
     studio_unlock(state);
-    elml_training_destroy(&training);
-    return NULL;
+    elml_training_destroy(training);
+    return false;
   }
 
   studio_lock(state);
-  state->active = &training;
+  state->active = training;
   state->snap.prepared = true;
-  state->snap.train_rows = training.train.rows;
-  state->snap.val_rows = training.val.rows;
-  state->snap.input_dim = training.train.input_dim;
-  state->snap.output_dim = training.train.output_dim;
-  state->snap.has_val = training.val.rows > 0u;
-  state->snap.has_accuracy = training.train.class_index != nullptr;
-  state->snap.best_loss = training.best_loss;
+  state->snap.train_rows = training->train.rows;
+  state->snap.val_rows = training->val.rows;
+  state->snap.input_dim = training->train.input_dim;
+  state->snap.output_dim = training->train.output_dim;
+  state->snap.has_val = training->val.rows > 0u;
+  state->snap.has_accuracy = training->train.class_index != nullptr;
+  state->snap.best_loss = training->best_loss;
   snprintf(state->snap.export_path, sizeof state->snap.export_path, "%s",
-           training.config.export_path);
+           training->config.export_path);
 
   size_t used = 0u;
   const int first = snprintf(state->snap.model, sizeof state->snap.model,
-                             "%u", training.train.input_dim);
+                             "%u", training->train.input_dim);
   if (first > 0) {
     used = (size_t)first;
   }
-  for (uint32_t i = 0u; i < training.net.layer_count; ++i) {
+  for (uint32_t i = 0u; i < training->net.layer_count; ++i) {
     const int written = snprintf(state->snap.model + used,
                                  sizeof state->snap.model - used, " -> %u",
-                                 training.net.layers[i].out_dim);
+                                 training->net.layers[i].out_dim);
     if (written < 0 || (size_t)written >= sizeof state->snap.model - used) {
       break;
     }
     used += (size_t)written;
   }
   snprintf(state->snap.algorithm, sizeof state->snap.algorithm, "%s + %s",
-           elml_loss_name(training.config.loss),
-           (training.config.optimizer == ELML_OPTIMIZER_ADAM) ? "Adam" : "SGD");
+           elml_loss_name(training->config.loss),
+           (training->config.optimizer == ELML_OPTIMIZER_ADAM) ? "Adam" : "SGD");
   snprintf(state->snap.status, sizeof state->snap.status,
            "Training %u rows (%u validation). Stop any time to keep the best "
            "epoch.",
-           training.train.rows, training.val.rows);
+           training->train.rows, training->val.rows);
   studio_unlock(state);
+  return true;
+}
 
-  status = elml_training_run(&training, studio_progress, state);
-
+static void studio_job_finish(studio_state *state, elml_training *training,
+                              elml_status status)
+{
   bool exported = false;
   char error[512];
   error[0] = '\0';
   if (status == ELML_OK) {
-    if (training.ran) {
-      const elml_status export_status = elml_training_export(&training);
+    if (training->ran) {
+      const elml_status export_status = elml_training_export(training);
       if (export_status == ELML_OK) {
         exported = true;
       } else {
         snprintf(error, sizeof error, "%s",
-                 (training.error[0] != '\0') ? training.error
-                                             : elml_error_string(export_status));
+                 (training->error[0] != '\0') ? training->error
+                                              : elml_error_string(export_status));
       }
     } else {
       snprintf(error, sizeof error, "%s",
@@ -1357,8 +1411,8 @@ static void *studio_worker(void *user)
     }
   } else {
     snprintf(error, sizeof error, "%s",
-             (training.error[0] != '\0') ? training.error
-                                         : elml_error_string(status));
+             (training->error[0] != '\0') ? training->error
+                                          : elml_error_string(status));
   }
 
   studio_lock(state);
@@ -1368,48 +1422,48 @@ static void *studio_worker(void *user)
   state->snap.finished = true;
   state->snap.exported = exported;
   state->eval_seed_export = exported;
-  state->snap.early_stopped = training.early_stopped;
-  state->snap.stopped = training.stopped;
-  state->snap.best_epoch = training.best_epoch;
-  state->snap.best_loss = training.best_loss;
-  state->snap.epoch = training.epochs_done;
-  state->snap.epochs = training.config.epochs;
-  state->snap.has_accuracy = training.train.class_index != nullptr;
-  state->snap.has_final_accuracy = training.has_final_accuracy;
-  state->snap.final_train_loss = training.final_train_loss;
-  state->snap.final_train_accuracy = training.final_train_accuracy;
-  state->snap.final_val_loss = training.final_val_loss;
-  state->snap.final_val_accuracy = training.final_val_accuracy;
-  if (training.ran) {
+  state->snap.early_stopped = training->early_stopped;
+  state->snap.stopped = training->stopped;
+  state->snap.best_epoch = training->best_epoch;
+  state->snap.best_loss = training->best_loss;
+  state->snap.epoch = training->epochs_done;
+  state->snap.epochs = training->config.epochs;
+  state->snap.has_accuracy = training->train.class_index != nullptr;
+  state->snap.has_final_accuracy = training->has_final_accuracy;
+  state->snap.final_train_loss = training->final_train_loss;
+  state->snap.final_train_accuracy = training->final_train_accuracy;
+  state->snap.final_val_loss = training->final_val_loss;
+  state->snap.final_val_accuracy = training->final_val_accuracy;
+  if (training->ran) {
     /* The exported model is the best-weight snapshot, so the KPI cards should
      * describe that model rather than the last epoch that ran. */
-    if (training.val.rows > 0u) {
-      state->snap.loss = training.final_val_loss;
-      state->snap.accuracy = training.final_val_accuracy;
+    if (training->val.rows > 0u) {
+      state->snap.loss = training->final_val_loss;
+      state->snap.accuracy = training->final_val_accuracy;
     } else {
-      state->snap.loss = training.final_train_loss;
-      state->snap.accuracy = training.final_train_accuracy;
+      state->snap.loss = training->final_train_loss;
+      state->snap.accuracy = training->final_train_accuracy;
     }
   }
   if (exported) {
-    if (training.early_stopped) {
+    if (training->early_stopped) {
       snprintf(state->snap.status, sizeof state->snap.status,
                "Early stopped at epoch %u (best epoch %u). Exported %s.",
-               training.epochs_done, training.best_epoch,
-               training.config.export_path);
-    } else if (training.stopped) {
+               training->epochs_done, training->best_epoch,
+               training->config.export_path);
+    } else if (training->stopped) {
       snprintf(state->snap.status, sizeof state->snap.status,
                "Stopped at epoch %u (best epoch %u). Exported %s.",
-               training.epochs_done, training.best_epoch,
-               training.config.export_path);
+               training->epochs_done, training->best_epoch,
+               training->config.export_path);
     } else {
       snprintf(state->snap.status, sizeof state->snap.status,
                "Training complete after %u epochs (best epoch %u). Exported "
                "%s.",
-               training.epochs_done, training.best_epoch,
-               training.config.export_path);
+               training->epochs_done, training->best_epoch,
+               training->config.export_path);
     }
-  } else if (status == ELML_OK && !training.ran) {
+  } else if (status == ELML_OK && !training->ran) {
     snprintf(state->snap.status, sizeof state->snap.status, "%s",
              "Stopped before the first epoch; nothing was exported.");
   } else if (status == ELML_OK) {
@@ -1421,20 +1475,65 @@ static void *studio_worker(void *user)
   }
   snprintf(state->snap.error, sizeof state->snap.error, "%s", error);
   studio_unlock(state);
+}
 
+#if !defined(ELML_WASM)
+static void *studio_worker(void *user)
+{
+  studio_state *state = (studio_state *)user;
+  elml_training training;
+  if (!studio_job_prepare(state, &training)) {
+    return NULL;
+  }
+  const elml_status status =
+      elml_training_run(&training, studio_progress, state);
+  studio_job_finish(state, &training, status);
   elml_training_destroy(&training);
   return NULL;
 }
+#endif
+
+#if defined(ELML_WASM)
+static void studio_web_pump(studio_state *state)
+{
+  if (!state->web_job_active) {
+    return;
+  }
+
+  elml_train_step step;
+  const elml_status status =
+      elml_training_step_epoch(&state->web_training, &step);
+  if (status != ELML_OK) {
+    studio_job_finish(state, &state->web_training, status);
+    elml_training_destroy(&state->web_training);
+    state->web_job_active = false;
+    return;
+  }
+  if (step.epoch_completed) {
+    studio_progress(&step.metrics, state);
+  }
+  if (step.done) {
+    studio_job_finish(state, &state->web_training, ELML_OK);
+    elml_training_destroy(&state->web_training);
+    state->web_job_active = false;
+  }
+  if (state->web_job_active) {
+    cui_request_redraw(studio_ui(state));
+  }
+}
+#endif
 
 static void studio_start(studio_state *state)
 {
   if (studio_is_running(state)) {
     return;
   }
+#if !defined(ELML_WASM)
   if (state->worker_started) {
     (void)pthread_join(state->worker, nullptr);
     state->worker_started = false;
   }
+#endif
 
   elml_config config;
   char error[256];
@@ -1455,8 +1554,16 @@ static void studio_start(studio_state *state)
   studio_unlock(state);
 
   /* Wake the event-driven loop for the first snapshot. */
-  cui_request_redraw(cui_app_ui(state->app));
+  cui_request_redraw(studio_ui(state));
 
+#if defined(ELML_WASM)
+  /* No threads in the browser: prepare here and run one epoch per frame in
+   * studio_web_pump(), which the page's frame callback drives. */
+  if (!studio_job_prepare(state, &state->web_training)) {
+    return; /* prepare published the error and cleared the running flag */
+  }
+  state->web_job_active = true;
+#else
   if (pthread_create(&state->worker, nullptr, studio_worker, state) != 0) {
     studio_lock(state);
     state->running = false;
@@ -1468,6 +1575,7 @@ static void studio_start(studio_state *state)
     return;
   }
   state->worker_started = true;
+#endif
 }
 
 static void studio_stop(studio_state *state)
@@ -1488,6 +1596,12 @@ static void studio_shutdown(studio_state *state)
     elml_training_request_stop(state->active);
   }
   studio_unlock(state);
+#if defined(ELML_WASM)
+  if (state->web_job_active) {
+    elml_training_destroy(&state->web_training);
+    state->web_job_active = false;
+  }
+#else
   if (state->worker_started) {
     (void)pthread_join(state->worker, nullptr);
     state->worker_started = false;
@@ -1496,6 +1610,7 @@ static void studio_shutdown(studio_state *state)
     (void)pthread_join(state->eval_worker, nullptr);
     state->eval_join_needed = false;
   }
+#endif
   elml_eval_free(&state->eval_result);
   elml_eval_free(&state->eval_staging);
 }
@@ -1546,10 +1661,8 @@ static void studio_eval_summary(const elml_eval_result *result, char *out,
   }
 }
 
-static void *studio_eval_worker(void *user)
+static void studio_eval_execute(studio_state *state)
 {
-  studio_state *state = (studio_state *)user;
-
   const elml_eval_options options = {
       .model_path = state->eval_model_path,
       .csv_path = state->eval_csv_path,
@@ -1584,19 +1697,28 @@ static void *studio_eval_worker(void *user)
   }
   studio_unlock(state);
 
-  cui_request_redraw(cui_app_ui(state->app));
+  cui_request_redraw(studio_ui(state));
+}
+
+#if !defined(ELML_WASM)
+static void *studio_eval_worker(void *user)
+{
+  studio_eval_execute((studio_state *)user);
   return NULL;
 }
+#endif
 
 static void studio_eval_start(studio_state *state)
 {
   if (studio_eval_running(state)) {
     return;
   }
+#if !defined(ELML_WASM)
   if (state->eval_join_needed) {
     (void)pthread_join(state->eval_worker, nullptr);
     state->eval_join_needed = false;
   }
+#endif
 
   if (state->eval_model_path[0] == '\0') {
     snprintf(state->eval_error, sizeof state->eval_error, "%s",
@@ -1633,8 +1755,12 @@ static void studio_eval_start(studio_state *state)
            "Evaluating every row against the model...");
   studio_unlock(state);
 
-  cui_request_redraw(cui_app_ui(state->app));
+  cui_request_redraw(studio_ui(state));
 
+#if defined(ELML_WASM)
+  /* No threads in the browser: run the evaluation in this frame. */
+  studio_eval_execute(state);
+#else
   if (pthread_create(&state->eval_worker, nullptr, studio_eval_worker, state) !=
       0) {
     studio_lock(state);
@@ -1645,6 +1771,7 @@ static void studio_eval_start(studio_state *state)
     return;
   }
   state->eval_join_needed = true;
+#endif
 }
 
 static void studio_eval_collect(studio_state *state)
@@ -1688,10 +1815,12 @@ static void studio_eval_collect(studio_state *state)
     state->eval_scroll_results = state->eval_ok;
   }
 
+#if !defined(ELML_WASM)
   if (state->eval_join_needed) {
     (void)pthread_join(state->eval_worker, nullptr);
     state->eval_join_needed = false;
   }
+#endif
 }
 
 static void studio_take_view(studio_state *state, studio_view *view)
@@ -1740,6 +1869,43 @@ static void studio_text_field(cui_ctx *ui, const char *id, const char *label,
   }
 }
 
+static bool studio_pick_file(studio_state *state, const char *id,
+                             const cui_file_dialog_opts *opts, char *out,
+                             size_t cap)
+{
+#if defined(ELML_WASM)
+  /*
+   * The page owns the file picker. We only tell it which slot was clicked;
+   * when the user chooses a file, JS registers the bytes and calls
+   * elml_studio_set_file() with the matching kind.
+   */
+  (void)state;
+  (void)opts;
+  (void)out;
+  (void)cap;
+  int kind = -1;
+  if (strcmp(id, "config_path") == 0 ||
+      strcmp(id, "eval_config_path") == 0) {
+    kind = 0;
+  } else if (strcmp(id, "csv_path") == 0) {
+    kind = 1;
+  } else if (strcmp(id, "val_csv_path") == 0) {
+    kind = 2;
+  } else if (strcmp(id, "eval_model_path") == 0) {
+    kind = 3;
+  } else if (strcmp(id, "eval_csv_path") == 0) {
+    kind = 4;
+  }
+  if (kind >= 0) {
+    js_studio_pick_file(kind);
+  }
+  return false;
+#else
+  (void)id;
+  return cui_app_file_dialog(state->app, opts, out, cap);
+#endif
+}
+
 static void studio_path_field(cui_ctx *ui, studio_state *state, const char *id,
                               const char *label, char *buffer, size_t cap,
                               cui_file_dialog_kind kind,
@@ -1756,8 +1922,8 @@ static void studio_path_field(cui_ctx *ui, studio_state *state, const char *id,
                         .tooltip = "Browse")) {
       char picked[STUDIO_PATH_MAX];
       picked[0] = '\0';
-      if (cui_app_file_dialog(
-              state->app,
+      if (studio_pick_file(
+              state, id,
               &(cui_file_dialog_opts){.kind = kind,
                                       .title = label,
                                       .filter_name = filter_name,
@@ -1968,8 +2134,8 @@ static bool studio_sidebar(cui_ctx *ui, studio_state *state, bool running)
                             .tooltip = "Browse for an .ini file")) {
           char picked[STUDIO_PATH_MAX];
           picked[0] = '\0';
-          if (cui_app_file_dialog(
-                  state->app,
+          if (studio_pick_file(
+                  state, "config_path",
                   &(cui_file_dialog_opts){
                       .kind = CUI_FILE_OPEN,
                       .title = "Open training configuration",
@@ -2593,6 +2759,10 @@ static void studio_eval_save(studio_state *state)
     return;
   }
   char picked[STUDIO_PATH_MAX];
+#if defined(ELML_WASM)
+  /* Browser: write into the in-memory table; the Files panel downloads it. */
+  snprintf(picked, sizeof picked, "%s", "predictions.csv");
+#else
   picked[0] = '\0';
   if (!cui_app_file_dialog(
           state->app,
@@ -2604,6 +2774,7 @@ static void studio_eval_save(studio_state *state)
           picked, sizeof picked)) {
     return;
   }
+#endif
 
   const elml_status status = elml_eval_write_csv(&state->eval_result, picked);
   if (status == ELML_OK) {
@@ -2654,8 +2825,8 @@ static bool studio_eval_controls(cui_ctx *ui, studio_state *state)
                           .tooltip = "Browse for an .ini file")) {
         char picked[STUDIO_PATH_MAX];
         picked[0] = '\0';
-        if (cui_app_file_dialog(
-                state->app,
+        if (studio_pick_file(
+                state, "eval_config_path",
                 &(cui_file_dialog_opts){.kind = CUI_FILE_OPEN,
                                         .title = "Open training configuration",
                                         .filter_name = "INI files",
@@ -3255,6 +3426,7 @@ static void studio_frame(cui_ctx *ui, studio_state *state)
   }
 }
 
+#if !defined(ELML_WASM)
 static bool studio_parse_args(studio_state *state, int argc, char **argv,
                               bool *autostart, bool *autoeval)
 {
@@ -3298,21 +3470,380 @@ static bool studio_parse_args(studio_state *state, int argc, char **argv,
   }
   return true;
 }
+#endif /* !ELML_WASM */
 
+#if defined(ELML_WASM)
+/* ------------------------------------------------------------------------- */
+/* Browser glue                                                              */
+/* ------------------------------------------------------------------------- */
+
+static studio_state *studio_web_current;
+
+/* Prototypes for the exports below, so -Wmissing-prototypes stays quiet. */
+int elml_studio_set_file(int kind, const char *name, const void *data,
+                         int len);
+void elml_studio_start(void);
+void elml_studio_stop(void);
+void elml_studio_shutdown(void);
+void elml_studio_evaluate(void);
+int elml_studio_epoch(void);
+int elml_studio_running(void);
+int elml_studio_eval_running(void);
+int elml_studio_finished(void);
+int elml_studio_exported(void);
+const char *elml_studio_status(void);
+const char *elml_studio_error(void);
+float elml_studio_loss(void);
+float elml_studio_accuracy(void);
+int elml_studio_has_accuracy(void);
+int elml_studio_epochs(void);
+int elml_studio_best_epoch(void);
+int elml_studio_train_rows(void);
+int elml_studio_val_rows(void);
+const char *elml_studio_model(void);
+const char *elml_studio_algorithm(void);
+int elml_studio_tab(void);
+void elml_studio_set_tab(int tab);
+const char *elml_studio_eval_status(void);
+const char *elml_studio_eval_error(void);
+int elml_studio_eval_has_result(void);
+int elml_studio_eval_correct(void);
+int elml_studio_file_count(void);
+const char *elml_studio_file_name(int index);
+int elml_studio_file_size(int index);
+const uint8_t *elml_studio_read_file(const char *path, int *len);
+
+static void studio_web_frame(cui_ctx *ui, void *user)
+{
+  studio_state *state = (studio_state *)user;
+  state->ui = ui;
+  studio_web_pump(state);
+  studio_frame(ui, state);
+}
+
+/* kind: 0 config, 1 training CSV, 2 validation CSV, 3 model, 4 evaluation CSV.
+ * The page registers the bytes first, then calls this. */
+STUDIO_EXPORT(elml_studio_set_file)
+int elml_studio_set_file(int kind, const char *name, const void *data, int len)
+{
+  studio_state *state = studio_web_current;
+  if (state == nullptr || name == nullptr || len < 0) {
+    return 1;
+  }
+  if (!elml_memfs_put(name, data, (size_t)len)) {
+    return 2;
+  }
+
+  switch (kind) {
+  case 0:
+    snprintf(state->config_path, sizeof state->config_path, "%s", name);
+    studio_load_config(state, false);
+    break;
+  case 1:
+    snprintf(state->csv_path, sizeof state->csv_path, "%s", name);
+    (void)studio_columns_load(state, true);
+    break;
+  case 2:
+    snprintf(state->val_csv_path, sizeof state->val_csv_path, "%s", name);
+    break;
+  case 3:
+    snprintf(state->eval_model_path, sizeof state->eval_model_path, "%s",
+             name);
+    if (state->eval_has_result) {
+      elml_eval_free(&state->eval_result);
+      state->eval_has_result = false;
+      state->eval_ok = false;
+      state->eval_error[0] = '\0';
+      snprintf(state->eval_status, sizeof state->eval_status, "%s",
+               "Model changed; evaluate again to refresh the results.");
+    }
+    break;
+  case 4:
+    snprintf(state->eval_csv_path, sizeof state->eval_csv_path, "%s", name);
+    (void)studio_eval_columns_load(state, true);
+    if (state->eval_has_result) {
+      elml_eval_free(&state->eval_result);
+      state->eval_has_result = false;
+      state->eval_ok = false;
+      state->eval_error[0] = '\0';
+      snprintf(state->eval_status, sizeof state->eval_status, "%s",
+               "CSV changed; evaluate again to refresh the results.");
+    }
+    break;
+  default:
+    return 3;
+  }
+
+  if (studio_ui(state) != nullptr) {
+    cui_request_redraw(studio_ui(state));
+  }
+  return 0;
+}
+
+STUDIO_EXPORT(elml_studio_start)
+void elml_studio_start(void)
+{
+  if (studio_web_current != nullptr) {
+    studio_start(studio_web_current);
+  }
+}
+
+STUDIO_EXPORT(elml_studio_stop)
+void elml_studio_stop(void)
+{
+  if (studio_web_current != nullptr) {
+    studio_stop(studio_web_current);
+  }
+}
+
+/* Called from the page's pagehide handler: drop the training session and the
+ * evaluation results before the module goes away. */
+STUDIO_EXPORT(elml_studio_shutdown)
+void elml_studio_shutdown(void)
+{
+  if (studio_web_current != nullptr) {
+    studio_shutdown(studio_web_current);
+  }
+}
+
+STUDIO_EXPORT(elml_studio_evaluate)
+void elml_studio_evaluate(void)
+{
+  if (studio_web_current != nullptr) {
+    studio_eval_start(studio_web_current);
+  }
+}
+
+/* Small read-only accessors for the page and the Node smoke test. */
+STUDIO_EXPORT(elml_studio_epoch)
+int elml_studio_epoch(void)
+{
+  return (studio_web_current != nullptr)
+             ? (int)studio_web_current->snap.epoch
+             : 0;
+}
+
+STUDIO_EXPORT(elml_studio_running)
+int elml_studio_running(void)
+{
+  return (studio_web_current != nullptr && studio_web_current->running) ? 1 : 0;
+}
+
+STUDIO_EXPORT(elml_studio_eval_running)
+int elml_studio_eval_running(void)
+{
+  return (studio_web_current != nullptr && studio_web_current->eval_running) ? 1
+                                                                            : 0;
+}
+
+STUDIO_EXPORT(elml_studio_finished)
+int elml_studio_finished(void)
+{
+  return (studio_web_current != nullptr && studio_web_current->finished) ? 1 : 0;
+}
+
+STUDIO_EXPORT(elml_studio_exported)
+int elml_studio_exported(void)
+{
+  return (studio_web_current != nullptr && studio_web_current->snap.exported)
+             ? 1
+             : 0;
+}
+
+STUDIO_EXPORT(elml_studio_status)
+const char *elml_studio_status(void)
+{
+  return (studio_web_current != nullptr) ? studio_web_current->snap.status : "";
+}
+
+STUDIO_EXPORT(elml_studio_error)
+const char *elml_studio_error(void)
+{
+  return (studio_web_current != nullptr) ? studio_web_current->snap.error : "";
+}
+
+STUDIO_EXPORT(elml_studio_loss)
+float elml_studio_loss(void)
+{
+  return (studio_web_current != nullptr) ? studio_web_current->snap.loss : 0.0f;
+}
+
+STUDIO_EXPORT(elml_studio_accuracy)
+float elml_studio_accuracy(void)
+{
+  return (studio_web_current != nullptr) ? studio_web_current->snap.accuracy
+                                         : 0.0f;
+}
+
+STUDIO_EXPORT(elml_studio_has_accuracy)
+int elml_studio_has_accuracy(void)
+{
+  return (studio_web_current != nullptr && studio_web_current->snap.has_accuracy)
+             ? 1
+             : 0;
+}
+
+STUDIO_EXPORT(elml_studio_epochs)
+int elml_studio_epochs(void)
+{
+  return (studio_web_current != nullptr) ? (int)studio_web_current->snap.epochs
+                                         : 0;
+}
+
+STUDIO_EXPORT(elml_studio_best_epoch)
+int elml_studio_best_epoch(void)
+{
+  return (studio_web_current != nullptr)
+             ? (int)studio_web_current->snap.best_epoch
+             : 0;
+}
+
+STUDIO_EXPORT(elml_studio_train_rows)
+int elml_studio_train_rows(void)
+{
+  return (studio_web_current != nullptr)
+             ? (int)studio_web_current->snap.train_rows
+             : 0;
+}
+
+STUDIO_EXPORT(elml_studio_val_rows)
+int elml_studio_val_rows(void)
+{
+  return (studio_web_current != nullptr) ? (int)studio_web_current->snap.val_rows
+                                         : 0;
+}
+
+STUDIO_EXPORT(elml_studio_model)
+const char *elml_studio_model(void)
+{
+  return (studio_web_current != nullptr) ? studio_web_current->snap.model : "";
+}
+
+STUDIO_EXPORT(elml_studio_algorithm)
+const char *elml_studio_algorithm(void)
+{
+  return (studio_web_current != nullptr) ? studio_web_current->snap.algorithm
+                                         : "";
+}
+
+STUDIO_EXPORT(elml_studio_tab)
+int elml_studio_tab(void)
+{
+  return (studio_web_current != nullptr) ? studio_web_current->tab : 0;
+}
+
+STUDIO_EXPORT(elml_studio_set_tab)
+void elml_studio_set_tab(int tab)
+{
+  if (studio_web_current != nullptr) {
+    studio_web_current->tab = (tab == 1) ? 1 : 0;
+    if (studio_ui(studio_web_current) != nullptr) {
+      cui_request_redraw(studio_ui(studio_web_current));
+    }
+  }
+}
+
+STUDIO_EXPORT(elml_studio_eval_status)
+const char *elml_studio_eval_status(void)
+{
+  return (studio_web_current != nullptr) ? studio_web_current->eval_status
+                                         : "";
+}
+
+STUDIO_EXPORT(elml_studio_eval_error)
+const char *elml_studio_eval_error(void)
+{
+  return (studio_web_current != nullptr) ? studio_web_current->eval_error : "";
+}
+
+STUDIO_EXPORT(elml_studio_eval_has_result)
+int elml_studio_eval_has_result(void)
+{
+  return (studio_web_current != nullptr &&
+          studio_web_current->eval_has_result)
+             ? 1
+             : 0;
+}
+
+STUDIO_EXPORT(elml_studio_eval_correct)
+int elml_studio_eval_correct(void)
+{
+  return (studio_web_current != nullptr)
+             ? (int)studio_web_current->eval_result.correct
+             : 0;
+}
+
+STUDIO_EXPORT(elml_studio_file_count)
+int elml_studio_file_count(void)
+{
+  return elml_memfs_count();
+}
+
+STUDIO_EXPORT(elml_studio_file_name)
+const char *elml_studio_file_name(int index)
+{
+  return elml_memfs_name(index);
+}
+
+STUDIO_EXPORT(elml_studio_file_size)
+int elml_studio_file_size(int index)
+{
+  const size_t size = elml_memfs_size(index);
+  return (size > (size_t)INT_MAX) ? INT_MAX : (int)size;
+}
+
+STUDIO_EXPORT(elml_studio_read_file)
+const uint8_t *elml_studio_read_file(const char *path, int *len)
+{
+  const uint8_t *data = nullptr;
+  size_t size = 0u;
+  if (!elml_memfs_get(path, &data, &size)) {
+    return nullptr;
+  }
+  if (len != nullptr) {
+    *len = (size > (size_t)INT_MAX) ? INT_MAX : (int)size;
+  }
+  return data;
+}
+#endif /* ELML_WASM */
+
+#if defined(ELML_WASM)
+int main(void)
+#else
 int main(int argc, char **argv)
+#endif
 {
   studio_state *state = (studio_state *)calloc(1u, sizeof *state);
   if (state == nullptr) {
     fprintf(stderr, "elml_studio: out of memory\n");
     return 1;
   }
+#if !defined(ELML_WASM)
   if (pthread_mutex_init(&state->mutex, nullptr) != 0) {
     fprintf(stderr, "elml_studio: cannot create the UI mutex\n");
     free(state);
     return 1;
   }
+#endif
 
   studio_defaults(state);
+
+#if defined(ELML_WASM)
+  /*
+   * The page's loader calls web_boot -> web_app_main (this function). CUI
+   * records the frame callback and returns; web/host drives it afterwards.
+   * The state therefore outlives this call and is never freed.
+   */
+  studio_web_current = state;
+  (void)cui_app_run(&(cui_app_desc){
+                        .title = "embedlml studio",
+                        .width = 1320,
+                        .height = 880,
+                        .theme = CUI_THEME_DARK,
+                        .accent = CUI_ACCENT_VIOLET},
+                    studio_web_frame, state);
+  return 0;
+#else
   bool autostart = false;
   bool autoeval = false;
   if (!studio_parse_args(state, argc, argv, &autostart, &autoeval)) {
@@ -3337,13 +3868,14 @@ int main(int argc, char **argv)
     return 1;
   }
   state->app = app;
+  state->ui = cui_app_ui(app);
 
   bool start_requested = autostart;
   bool eval_requested = autoeval;
   const bool screenshot_mode = getenv("CUI_SCREENSHOT") != nullptr;
   double active_until = 0.0;
   while (cui_app_frame(app)) {
-    studio_frame(cui_app_ui(app), state);
+    studio_frame(state->ui, state);
     if (start_requested) {
       start_requested = false;
       studio_start(state);
@@ -3353,7 +3885,7 @@ int main(int argc, char **argv)
       studio_eval_start(state);
     }
     if (!screenshot_mode) {
-      studio_pace(cui_app_ui(app),
+      studio_pace(state->ui,
                   studio_is_running(state) || studio_eval_running(state),
                   &active_until);
     }
@@ -3366,4 +3898,5 @@ int main(int argc, char **argv)
   pthread_mutex_destroy(&state->mutex);
   free(state);
   return 0;
+#endif
 }

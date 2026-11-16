@@ -326,6 +326,7 @@ elml_status elml_csv_parse(const char *text, size_t len, char delimiter,
   return elml_csv_parse_impl(text, len, delimiter, has_header, false, out);
 }
 
+#if !defined(ELML_WASM)
 static elml_status elml_csv_buffer_put(char **buffer, size_t *length,
                                        size_t *capacity, char c)
 {
@@ -353,6 +354,7 @@ static elml_status elml_csv_buffer_put(char **buffer, size_t *length,
   *length = needed;
   return ELML_OK;
 }
+#endif /* !ELML_WASM */
 
 static bool elml_csv_record_has_open_quote(const char *text, size_t len,
                                            size_t pos)
@@ -371,6 +373,7 @@ static bool elml_csv_record_has_open_quote(const char *text, size_t len,
   return in_quotes;
 }
 
+#if !defined(ELML_WASM)
 /* Read one physical line, appending it to the record buffer. */
 static bool elml_csv_read_line(FILE *file, char **buffer, size_t *length,
                                size_t *capacity, elml_status *status)
@@ -389,6 +392,7 @@ static bool elml_csv_read_line(FILE *file, char **buffer, size_t *length,
   }
   return got;
 }
+#endif /* !ELML_WASM */
 
 elml_status elml_csv_read_header(const char *path, char delimiter,
                                  elml_csv *out)
@@ -398,6 +402,62 @@ elml_status elml_csv_read_header(const char *path, char delimiter,
     return ELML_ERR_INVALID_ARG;
   }
   memset(out, 0, sizeof *out);
+
+#if defined(ELML_WASM)
+  /*
+   * The browser has no stdio file system: read the whole file from the
+   * in-memory table and locate the first record in the buffer. The record
+   * boundaries mirror elml_csv_read_line(), including the trailing newline.
+   */
+  uint8_t *data = nullptr;
+  size_t size = 0u;
+  elml_status status = elml_read_file(path, &data, &size, 0u);
+  if (status != ELML_OK) {
+    return status;
+  }
+
+  const char *text = (const char *)data;
+  size_t pos = 0u;
+  if (size >= 3u && (uint8_t)text[0] == 0xEFu &&
+      (uint8_t)text[1] == 0xBBu && (uint8_t)text[2] == 0xBFu) {
+    pos = 3u;
+  }
+
+  for (;;) {
+    size_t end = pos;
+    while (end < size && text[end] != '\n') {
+      ++end;
+    }
+    size_t length = end - pos + ((end < size) ? 1u : 0u);
+    size_t skip = 0u;
+    if (!elml_skip_blank_or_comment(text + pos, length, &skip)) {
+      /* Blank line or comment: move on to the next physical line. */
+      if (end >= size) {
+        status = ELML_ERR_TRUNCATED;
+        goto wasm_done;
+      }
+      pos = end + 1u;
+      continue;
+    }
+    while (elml_csv_record_has_open_quote(text + pos, length, skip)) {
+      if (end >= size) {
+        status = ELML_ERR_TRUNCATED;
+        goto wasm_done;
+      }
+      ++end;
+      while (end < size && text[end] != '\n') {
+        ++end;
+      }
+      length = end - pos + ((end < size) ? 1u : 0u);
+    }
+    status = elml_csv_parse_impl(text + pos, length, delimiter, false, true, out);
+    break;
+  }
+
+wasm_done:
+  free(data);
+  return status;
+#else
 
   FILE *file = fopen(path, "rb");
   if (file == nullptr) {
@@ -461,6 +521,7 @@ done:
   free(record);
   fclose(file);
   return status;
+#endif /* ELML_WASM */
 }
 
 elml_status elml_csv_load(const char *path, char delimiter, bool has_header,

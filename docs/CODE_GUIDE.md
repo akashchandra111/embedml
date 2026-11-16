@@ -27,13 +27,18 @@ Defines the project, options, warning set, and targets.
   `kernels/common/scalar_f32.c`, plus one architecture kernel file selected by
   `ELML_SIMD` and `CMAKE_SYSTEM_PROCESSOR`.
 * `elml_train_lib` (static library, host only): writer plus trainer support.
-  Sources are `write.c`, `csv.c`, `ini.c`, `io.c`, `config.c`, `dataset.c`,
-  `net.c`, `evaluate.c`, `session.c`, `export.c`.
+  Sources are `write.c`, `csv.c`, `ini.c`, `io.c`, `memfs.c`, `config.c`,
+  `dataset.c`, `net.c`, `evaluate.c`, `session.c`, `export.c`.
 * `elml_inspect`: parses and prints a model without running it.
 * `elml_train`: the training executable.
 * `elml_run`: the inference/evaluation executable.
 * `elml_studio` (optional, `ELML_BUILD_STUDIO=ON`): CUI desktop frontend that
   links `elml_train_lib`, `Threads::Threads`, and `cui::cui`.
+* `elml_web` (optional, `ELML_BUILD_WEB=ON`): a custom target that runs
+  `wasm/build.sh` and an `add_test(NAME wasm_studio)` entry that runs
+  `wasm/ctest.sh`. Configure warns and skips the target when `clang`,
+  `wasm-ld`, `llvm-ar`, or `node` is missing. `ELML_WEB_JOBS` controls the
+  compile parallelism.
 * CUI is vendored as the `third_party/CUI` git submodule. `ELML_CUI_SOURCE_DIR`
   overrides it with another checkout, and configure fails with an
   initialization hint when the submodule is missing.
@@ -369,6 +374,8 @@ kernels/
   arm64/neon_f32.c       NEON kernels
   riscv/riscv.h          RISC-V kernel declarations
   riscv/vector_f32.c     RVV 1.0 kernels
+  wasm/wasm.h            wasm SIMD128 kernel declarations
+  wasm/simd128_f32.c     SIMD128 kernels
 ```
 
 ### `kernels.h`
@@ -416,6 +423,9 @@ Selects an implementation for each call:
 * arm64: NEON (baseline on AArch64).
 * RISC-V: RVV when the translation unit is built with vector support
   (`__riscv_vector`), otherwise scalar.
+* wasm32: SIMD128 when the target defines `__wasm_simd128__`
+  (`-msimd128`), otherwise scalar. There is no runtime probe because a module
+  either validates in the engine or it does not.
 * `ELML_STRICT_FP` or `ELML_SIMD=OFF`: always scalar.
 
 ### `x86_64/simd_f32.c`
@@ -441,6 +451,14 @@ RVV 1.0 equivalents using `vsetvl`, `vle32`/`vse32`, `vfmacc`, and a
 `vfredusum` reduction. The file is only built when vector support is enabled in
 the toolchain.
 
+### `wasm/simd128_f32.c`
+
+SIMD128 equivalents of the three dense kernels, built by `wasm/build.sh` when
+the module is compiled with `-msimd128` (the default; set `ELML_WASM_SIMD=0`
+for the scalar path). Base wasm SIMD has no fused multiply-add, so each vector
+step is a multiply and an add, followed by a lane-shuffled horizontal sum and a
+scalar tail.
+
 
 ---
 
@@ -450,13 +468,32 @@ The trainer is host-only and may allocate.
 
 ### `io.h` / `io.c`
 
+* `elml_aligned_alloc(alignment, size)` / `elml_aligned_free(ptr)`: portable
+  aligned allocation that keeps the original pointer in a header slot. Used for
+  model blobs so `elml_model_init` keeps its 64-byte requirement on targets
+  without `aligned_alloc` (notably wasm32).
 * `elml_read_file(path, data, len, alignment)`: reads an entire file. A
   non-zero alignment must be a power of two; the returned buffer is aligned and
   sized to a multiple of the alignment when needed. Returns `ELML_ERR_TRUNCATED`
-  for an empty file.
+  for an empty file. On wasm it resolves the path through `memfs` and copies
+  from the in-memory table.
 * `elml_write_file(path, data, len)`: writes the entire buffer, creating or
   truncating the file; reports `ELML_ERR_NOT_FOUND` if the file cannot be
-  opened.
+  opened. On wasm it stores the bytes in `memfs`.
+
+### `memfs.h` / `memfs.c` (wasm only)
+
+A 32-entry flat table that stands in for the file system in the browser. Every
+function compiles to nothing on the host.
+
+* `elml_memfs_put(path, data, len)`: copies the bytes into a new or existing
+  entry. The path is normalized (leading `/`, `./`, and doubled separators are
+  ignored) so `iris.csv`, `./iris.csv`, and `/iris.csv` name the same entry.
+* `elml_memfs_get(path, data, len)`: points at the stored bytes; valid until
+  the entry is replaced or the table is cleared.
+* `elml_memfs_remove`, `elml_memfs_clear`: drop one entry or all of them.
+* `elml_memfs_count`, `elml_memfs_name`, `elml_memfs_size`: enumerate entries
+  for the page's Files panel.
 
 ### `csv.h` / `csv.c`
 
@@ -654,10 +691,15 @@ Reusable host-only training session shared by the CLI and the studio.
 * `elml_training_init(training, config)`: loads the CSV(s), builds and splits
   the datasets, computes normalization, creates the network, and allocates the
   shuffle order. On failure it releases partial state and zeroes the struct.
-* `elml_training_run(training, progress, user)`: trains epoch by epoch, checks
-  the atomic stop flag at batch boundaries, monitors validation loss, snapshots
-  and restores the best weights, applies early stopping, and fills the final
-  metrics.
+* `elml_training_run(training, progress, user)`: loops over
+  `elml_training_step_epoch` and invokes the progress callback for each
+  completed epoch. Checks the atomic stop flag at batch boundaries, monitors
+  validation loss, snapshots and restores the best weights, applies early
+  stopping, and fills the final metrics.
+* `elml_training_step_epoch(training, step)`: cooperative variant for hosts
+  without worker threads (the browser). Runs at most one epoch, fills
+  `elml_train_step` with the same metrics, and finalizes the session on the
+  step that ends the run. `step.done` means no further epochs are available.
 * `elml_training_request_stop(training)`: safely requests a stop from another
   thread; the loop exits at the next batch boundary.
 * `elml_training_export(training)`: exports the restored best weights.
@@ -717,22 +759,30 @@ Command-line training executable.
 
 ## 7. Studio (`src/studio/`)
 
-The studio is optional, host-only, and built only when
-`ELML_BUILD_STUDIO=ON`. It links the same `elml_train_lib` as the CLI.
+The studio is optional and built only when `ELML_BUILD_STUDIO=ON` (desktop,
+CUI window) or `ELML_BUILD_WEB=ON` (browser, WebAssembly). It links the same
+`elml_train_lib` as the CLI. The same source file serves both: `ELML_WASM`
+selects the cooperative browser backend, the host keeps the pthread worker.
 
 ### `studio_main.c`
 
-CUI desktop frontend with a parameter sidebar, a Training tab, and an Evaluate
-tab for checking a saved model against a CSV.
+CUI frontend with a parameter sidebar, a Training tab, and an Evaluate tab for
+checking a saved model against a CSV.
 
 * `studio_snapshot` / `studio_view`: shared run state copied from the worker
   under a mutex once per frame; the view owns the chart arrays handed to CUI.
-* `studio_state`: UI parameters, training session pointer, worker thread,
-  mutex, chart history, column-picker state for both tabs, theme, the active
-  tab, and the Evaluate tab's paths, result, and evaluation thread.
+* `studio_state`: UI parameters, the active `cui_ctx`, training session pointer,
+  worker thread and mutex (host), the cooperative `web_training` session and
+  `web_job_active` flag (wasm), chart history, column-picker state for both
+  tabs, theme, the active tab, and the Evaluate tab's paths, result, and
+  evaluation thread.
+* `studio_ui`: returns the current `cui_ctx`. On the host it is
+  `cui_app_ui(state->app)`; in the browser the host passes the instance context
+  to `studio_web_frame`. Every redraw request goes through it.
 * `studio_lock` / `studio_unlock` / `studio_is_running` /
   `studio_eval_running`: protect the snapshot, stop state, and evaluation
-  hand-off shared with the worker threads.
+  hand-off shared with the worker threads. The wasm build compiles the locks to
+  no-ops because the page runs everything on one thread.
 * `studio_defaults`: sets initial parameter values and loads
   `examples/iris/iris.ini` when available.
 * `studio_apply_config` / `studio_load_config`: reuse `elml_config_load` and
@@ -755,19 +805,30 @@ tab for checking a saved model against a CSV.
   `elml_config_load`, so validation and finalization are identical to the CLI.
 * `studio_progress`: mutex-protected epoch callback; appends loss/accuracy
   history for the charts.
-* `studio_worker`: owns the `elml_training` session, runs the loop, exports the
-  best weights, and publishes final status/error text. A successful export
-  flags the Evaluate tab to reuse the new model path.
-* `studio_start` / `studio_stop` / `studio_shutdown`: create/join the worker
-  thread with `pthread_create` / `pthread_join` and request a stop through
-  `elml_training_request_stop`. Shutdown also joins the evaluation worker and
-  frees both result holders. Threads and mutexes are POSIX so the studio builds
-  on macOS as well as Linux.
-* `studio_eval_start` / `studio_eval_worker` / `studio_eval_collect`: run
-  `elml_eval_run` on a second pthread. The worker moves its result into a
-  mutex-protected staging record; the UI thread moves that record into
-  `eval_result` at the start of the next frame, so CUI never sees a
-  half-written struct. Evaluation skips malformed rows instead of aborting.
+* `studio_job_prepare` / `studio_job_finish`: shared job setup and completion.
+  Prepare initializes the session and publishes rows, dimensions, model shape,
+  and the export path. Finish exports the best weights and publishes final
+  status, error, early-stop/stopped flags, and the final train/validation
+  numbers. Both are used by the host worker and the browser pump.
+* `studio_worker`: host only. Owns the `elml_training` session, runs
+  `elml_training_run` on a pthread, then calls finish.
+* `studio_web_pump`: wasm only. Calls `elml_training_step_epoch` once per frame,
+  publishes the same metrics the progress callback would, requests a redraw,
+  and destroys the session on the step that reports `done`.
+* `studio_start` / `studio_stop` / `studio_shutdown`: on the host, create/join
+  the worker thread with `pthread_create` / `pthread_join` and request a stop
+  through `elml_training_request_stop`. In the browser, start prepares the
+  session in place and lets the frame pump drive it. Shutdown joins the host
+  workers or destroys the cooperative session, then frees both result holders.
+* `studio_eval_execute`: the evaluator itself. It runs `elml_eval_run`, moves
+  the result into the mutex-protected staging record, and publishes the summary
+  or error text.
+* `studio_eval_start` / `studio_eval_worker` / `studio_eval_collect`: on the
+  host, run `studio_eval_execute` on a second pthread; the UI thread moves the
+  staged record into `eval_result` at the start of the next frame, so CUI never
+  sees a half-written struct. In the browser, `studio_eval_start` calls
+  `studio_eval_execute` inline and the same collect step moves the result.
+  Evaluation skips malformed rows instead of aborting.
 * `studio_eval_controls` / `studio_eval_metrics` / `studio_eval_model_card` /
   `studio_eval_table`: draw the model and CSV pickers, `.ini` loader, header,
   delimiter and scoring switches, the same CSV-header multi-select pickers the
@@ -776,31 +837,84 @@ tab for checking a saved model against a CSV.
   table with the **Incorrect only** filter. The table caps the display at
   `eval_display_limit` rows and points at the saved CSV for the rest.
 * `studio_eval_save`: writes the current result through
-  `elml_eval_write_csv` after a save dialog.
-* `studio_pace`: the main loop sleeps from the app side. CUI's X11 wait can
+  `elml_eval_write_csv` after a save dialog. In the browser there is no dialog:
+  it writes `predictions.csv` into `memfs`, where the Files panel can download
+  it.
+* `studio_pick_file`: host file dialog wrapper. In the browser it maps the
+  clicked field to a kind (0 config, 1 training CSV, 2 validation CSV, 3 model,
+  4 evaluation CSV) and calls the imported `js_studio_pick_file(kind)`.
+* `studio_pace`: the host main loop sleeps from the app side. CUI's X11 wait can
   return immediately whenever the display connection is readable, so an
   un-paced event loop redraws at the refresh rate while the window is idle and
   burns a core. The studio runs at full speed while something animates (hover,
   tooltips, chart tweens, plus a short hold afterwards), sleeps 30 ms per
   iteration during a run so epochs arrive at a readable pace, and sleeps 33 ms
-  when the window has nothing to show. `CUI_SCREENSHOT` mode skips pacing.
+  when the window has nothing to show. `CUI_SCREENSHOT` mode skips pacing. The
+  wasm build does not compile this path.
 * `studio_sidebar` / `studio_training_view` / `studio_main` / `studio_frame`:
   draw the parameter panel, the Training and Evaluate tabs, KPI cards, progress
   bar, charts, run details, evaluation summary and table, export status, and
   error alerts. The sidebar is shown on the Training tab; Evaluate uses the full
   width. A completed evaluation scrolls the view to its results.
-* `main`: parses `--config FILE`, `--evaluate`, `--autostart`, `--autoeval`,
-  and `--help`, creates the CUI app, runs frames, and releases the column
-  state and both workers on exit. `--autoeval` opens the Evaluate tab and runs
-  the configured CSV/model on startup.
+* `main`: on the host, parses `--config FILE`, `--evaluate`, `--autostart`,
+  `--autoeval`, and `--help`, creates the CUI app, runs frames, and releases
+  the column state and both workers on exit. `--autoeval` opens the Evaluate tab
+  and runs the configured CSV/model on startup. In the wasm build the same
+  function is compiled as `web_app_main`, `cui_app_run` only records the frame
+  callback, and the page drives it through `studio_web_frame`.
+* Browser exports (`ELML_WASM` only): `elml_studio_set_file`, `_start`,
+  `_stop`, `_shutdown`, `_evaluate`, `_set_tab`/`_tab`, `_epoch`/`_epochs`,
+  `_running`/`_finished`/`_exported`, `_loss`, `_accuracy`/`_has_accuracy`,
+  `_best_epoch`, `_train_rows`/`_val_rows`, `_model`, `_algorithm`,
+  `_status`/`_error`, `_eval_running`, `_eval_status`/`_eval_error`,
+  `_eval_has_result`/`_eval_correct`, and the file table accessors
+  `_file_count`/`_file_name`/`_file_size`/`_read_file`. Strings are returned as
+  pointers into the module's memory; the page decodes them before the next
+  mutation.
 
 The worker never calls CUI. Only the UI thread touches widgets and column
 state; the training thread only updates the mutex-protected snapshot and its
 atomic stop flag.
 
----
+## 8. Browser build (`wasm/`)
 
-## 8. Runner (`src/run/`)
+Static files plus a plain-clang build. No Emscripten, no sysroot, no package
+manager.
+
+* `build.sh`: compiles CUI's `src/cui_*.c`, `render/cui_render_sw.c`, the wasm
+  shim (`third_party/CUI/web/shim/libc.c`), the browser host
+  (`web_host.c`, `web_app.c`), and embedlml's core/trainer/studio with
+  `--target=wasm32`. It links with `wasm-ld`, copies the page and the iris
+  sample into the output directory, and reports the module size. `CC`,
+  `WASM_LD`, `LLVM_AR`, `JOBS`, `ELML_WEB_OUT`, and `ELML_WASM_SIMD` override
+  its defaults.
+* `web/loader.js`: self-contained loader for the module. It supplies the libc
+  imports (stdio through `js_write`, float formatting/parsing, clock, abort),
+  the math imports, inert texture/emoji hooks (the page uses the software
+  renderer), and `js_studio_pick_file`. It returns `setFile`, `readFile`,
+  `pixels`, and the raw exports.
+* `web/studio.js`: creates the instance (`inst_new(..., gpu_owner=0)`), sizes
+  the canvas to its container, copies the software surface with `putImageData`,
+  forwards mouse/wheel/keyboard/paste input, and calls the studio through
+  `requestAnimationFrame`. It also preloads the iris sample, drives the hidden
+  file inputs, and maintains the KPI cards and Files panel.
+* `web/index.html`, `web/style.css`: page chrome around the canvas; the studio
+  itself is drawn entirely by CUI.
+* `serve.sh`: serves the output directory with Python's `http.server`.
+* `test.mjs`: Node smoke test. It instantiates the module, registers the iris
+  sample, drives one frame per epoch, asserts the export, evaluates the model,
+  and prints the result. It uses no browser and no test framework.
+* `ctest.sh`: builds, then runs `test.mjs`; this is the `wasm_studio` CTest
+  entry.
+
+The browser has no threads, so the studio uses the cooperative
+`elml_training_step_epoch()` API and the `memfs` file table instead of stdio.
+Evaluation runs inline in the frame. `third_party/CUI`'s wasm shim provides
+libc, including its own allocator; its `pthread_create` always fails, its
+`fopen` returns `NULL`, and it has no `aligned_alloc`, which is why the trainer
+uses `elml_aligned_alloc` and the memfs branch.
+
+## 9. Runner (`src/run/`)
 
 ### `run_main.c`
 
@@ -847,7 +961,7 @@ prediction and the REPL keep a single loaded model.
 
 ---
 
-## 9. Tools (`tools/`)
+## 10. Tools (`tools/`)
 
 ### `inspect_main.c`
 
@@ -871,7 +985,7 @@ prediction and the REPL keep a single loaded model.
 
 ---
 
-## 10. Tests (`tests/`)
+## 11. Tests (`tests/`)
 
 ### `test.h`
 
@@ -966,7 +1080,7 @@ accuracy/host-check gates to pass.
 
 ---
 
-## 11. Examples (`examples/`)
+## 12. Examples (`examples/`)
 
 ### Iris (`examples/iris/`)
 
@@ -1065,7 +1179,7 @@ predictions.
 
 ---
 
-## 12. Control-flow walkthroughs
+## 13. Control-flow walkthroughs
 
 ### Training
 
@@ -1084,8 +1198,10 @@ main (train_main.c)
     elml_dataset_compute_norm / elml_dataset_apply_norm
     elml_net_create -> elml_layer_alloc, elml_net_init_weights
   elml_training_run
-    per epoch: elml_shuffle_order, elml_net_accumulate, elml_net_update
-    elml_net_evaluate, elml_net_save_best / elml_net_restore_best
+    elml_training_step_epoch (per epoch)
+      elml_shuffle_order, elml_net_accumulate, elml_net_update
+      elml_net_evaluate, elml_net_save_best
+      elml_training_finalize -> elml_net_restore_best
   elml_training_export
     elml_export_model
       elml_build_norm, elml_join_labels
@@ -1098,7 +1214,8 @@ main (train_main.c)
 
 The studio follows the same path. `studio_build_config` synthesizes CLI
 arguments and calls `elml_config_load`; `studio_worker` owns the session behind
-the shared `elml_train` library.
+the shared `elml_train` library on the host, while the browser calls
+`elml_training_step_epoch` once per animation frame through `studio_web_pump`.
 
 ### Loading and inference
 
@@ -1158,7 +1275,7 @@ elml_inspect (inspect_main.c)
 
 ---
 
-## 13. Where to make common changes
+## 14. Where to make common changes
 
 | Change | Files |
 | --- | --- |
@@ -1171,3 +1288,6 @@ elml_inspect (inspect_main.c)
 | New metadata key | `export.c`, `model.c` accessors if needed, `run_main.c`, format docs |
 | Format change | `format.h`, `read.c`, `write.c`, `docs/FORMAT.md`, `test_format.c` |
 | SIMD kernel | `kernels/kernels.h`, arch file under `kernels/<arch>/`, `kernels/common/dispatch.c`, CMake, `test_kernels.c` |
+| Browser build | `wasm/build.sh`, `CMakeLists.txt` (`ELML_BUILD_WEB`), `wasm/ctest.sh`, `README.md` |
+| Browser page or input | `wasm/web/studio.js`, `wasm/web/loader.js`, `wasm/web/index.html`, `wasm/web/style.css` |
+| New browser export | `src/studio/studio_main.c` (`ELML_WASM` block), `wasm/web/loader.js`, `wasm/test.mjs` |
