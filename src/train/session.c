@@ -10,6 +10,7 @@
 #include "train/csv.h"
 #include "train/export.h"
 
+[[gnu::format(printf, 2, 3)]]
 static void elml_training_error(elml_training *training, const char *fmt, ...)
 {
   if (training == nullptr || fmt == nullptr) {

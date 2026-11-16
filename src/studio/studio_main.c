@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 /*
  * elml_studio: a CUI desktop frontend for the embedlml trainer.
  *
@@ -13,22 +15,26 @@
 #include <cui/cui_app.h>
 #include <cui/cui_icons.h>
 
+#include <pthread.h>
+#include <time.h>
+
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <threads.h>
 
 #include "elml/model.h"
 #include "elml/registry.h"
 #include "elml/types.h"
 #include "train/config.h"
 #include "train/csv.h"
+#include "train/evaluate.h"
 #include "train/session.h"
 
 #ifndef ELML_STUDIO_EXAMPLE_CONFIG
@@ -98,8 +104,8 @@ typedef struct studio_columns {
 
 typedef struct studio_state {
   cui_app *app;
-  mtx_t mutex;
-  thrd_t worker;
+  pthread_mutex_t mutex;
+  pthread_t worker;
   bool worker_started;
 
   bool running;
@@ -109,6 +115,7 @@ typedef struct studio_state {
   studio_snapshot snap;
 
   studio_columns columns;
+  studio_columns eval_columns;
 
   float loss_history[STUDIO_HISTORY_MAX];
   float accuracy_history[STUDIO_HISTORY_MAX];
@@ -137,6 +144,34 @@ typedef struct studio_state {
   double l2;
   double early_stop;
 
+  /* Tabs: 0 trains, 1 evaluates a saved model against a CSV. */
+  int tab;
+
+  char eval_model_path[STUDIO_PATH_MAX];
+  char eval_csv_path[STUDIO_PATH_MAX];
+  char eval_inputs[STUDIO_LIST_MAX];
+  char eval_targets[STUDIO_LIST_MAX];
+  char eval_delimiter[8];
+  bool eval_has_header;
+  bool eval_score;
+  bool eval_show_errors_only;
+  uint32_t eval_display_limit;
+
+  bool eval_running;       /* guarded by the mutex */
+  bool eval_pending;       /* guarded by the mutex: staging holds a result */
+  bool eval_seed_export;   /* guarded by the mutex: copy the exported path */
+  pthread_t eval_worker;
+  bool eval_join_needed;
+
+  elml_eval_result eval_result;   /* UI thread only */
+  elml_eval_result eval_staging;  /* guarded by the mutex */
+  bool eval_has_result;
+  bool eval_ok;
+  bool eval_scroll_results;
+
+  char eval_error[1024];
+  char eval_status[512];
+
   cui_theme_mode theme;
 } studio_state;
 
@@ -160,8 +195,15 @@ static const char *const studio_missing_values[] = {"error", "zero", "mean"};
 
 #define STUDIO_COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
-static void studio_lock(studio_state *state) { (void)mtx_lock(&state->mutex); }
-static void studio_unlock(studio_state *state) { (void)mtx_unlock(&state->mutex); }
+static void studio_lock(studio_state *state)
+{
+  (void)pthread_mutex_lock(&state->mutex);
+}
+
+static void studio_unlock(studio_state *state)
+{
+  (void)pthread_mutex_unlock(&state->mutex);
+}
 
 static bool studio_is_running(studio_state *state)
 {
@@ -171,6 +213,60 @@ static bool studio_is_running(studio_state *state)
   return running;
 }
 
+static bool studio_eval_running(studio_state *state)
+{
+  studio_lock(state);
+  const bool running = state->eval_running;
+  studio_unlock(state);
+  return running;
+}
+
+/*
+ * CUI's X11 backend wakes as soon as the display connection is readable, which
+ * some drivers keep true permanently. The event-driven loop therefore redraws
+ * at the refresh rate even when nothing moves, which burns a core while the
+ * window sits idle. Pace the loop from the app side instead: let animations,
+ * hover fades and tooltips run at full speed, give a run its epoch cadence,
+ * and tick slowly when the window has nothing to show.
+ */
+#define STUDIO_IDLE_TICK_MS 33L
+#define STUDIO_RUN_TICK_MS 30L
+#define STUDIO_ACTIVE_HOLD_S 0.6
+
+static double studio_now(void)
+{
+  struct timespec ts;
+  (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void studio_sleep_ms(long ms)
+{
+  const struct timespec pause = {0, ms * 1000L * 1000L};
+  (void)nanosleep(&pause, nullptr);
+}
+
+static void studio_pace(cui_ctx *ui, bool running, double *active_until)
+{
+  if (running) {
+    studio_sleep_ms(STUDIO_RUN_TICK_MS);
+    return;
+  }
+
+  const double now = studio_now();
+  if (cui_needs_redraw(ui)) {
+    /* Something is moving (hover, tooltip, chart tween). Keep full speed for a
+     * moment afterwards so a moving pointer never waits on the slow tick. */
+    *active_until = now + STUDIO_ACTIVE_HOLD_S;
+    return;
+  }
+  if (now < *active_until) {
+    return;
+  }
+  studio_sleep_ms(STUDIO_IDLE_TICK_MS);
+}
+
+[[gnu::format(printf, 2, 3)]]
 static void studio_set_error(studio_state *state, const char *format, ...)
 {
   va_list args;
@@ -192,6 +288,7 @@ static void studio_clear_run_locked(studio_state *state)
 static void studio_defaults(studio_state *state)
 {
   state->theme = CUI_THEME_DARK;
+  state->tab = 0;
   state->has_header = true;
   state->hidden_activation = 0;
   state->loss_index = 0;
@@ -204,13 +301,19 @@ static void studio_defaults(studio_state *state)
   state->learning_rate = 0.001;
   state->l2 = 0.0;
   state->early_stop = 20.0;
+  state->eval_has_header = true;
+  state->eval_score = true;
+  state->eval_display_limit = 500u;
   snprintf(state->delimiter, sizeof state->delimiter, "%s", ",");
+  snprintf(state->eval_delimiter, sizeof state->eval_delimiter, "%s", ",");
   snprintf(state->layers, sizeof state->layers, "%s", "16");
   snprintf(state->export_path, sizeof state->export_path, "%s", "model.elml");
   snprintf(state->config_path, sizeof state->config_path, "%s",
            ELML_STUDIO_EXAMPLE_CONFIG);
   snprintf(state->snap.status, sizeof state->snap.status, "%s",
            "Set data paths, then start training.");
+  snprintf(state->eval_status, sizeof state->eval_status, "%s",
+           "Load a model and a CSV, then evaluate.");
 }
 
 static void studio_dirname(const char *path, char *out, size_t cap)
@@ -337,21 +440,59 @@ static char studio_delimiter_value(const char *text)
   return '\0';
 }
 
-static bool studio_columns_signature_matches(const studio_state *state)
+/* One column source: the CSV to scan and the two text lists it drives.
+ * Training and evaluation each own one so both share the same picker. */
+typedef struct studio_columns_config {
+  const char *csv_path;
+  const char *delimiter;
+  bool has_header;
+  char *inputs;
+  size_t inputs_cap;
+  char *outputs;
+  size_t outputs_cap;
+} studio_columns_config;
+
+static studio_columns_config studio_training_columns_config(studio_state *state)
 {
-  return state->columns.checked &&
-         strcmp(state->columns.path, state->csv_path) == 0 &&
-         strcmp(state->columns.delimiter, state->delimiter) == 0 &&
-         state->columns.has_header == state->has_header;
+  return (studio_columns_config){
+      .csv_path = state->csv_path,
+      .delimiter = state->delimiter,
+      .has_header = state->has_header,
+      .inputs = state->inputs,
+      .inputs_cap = sizeof state->inputs,
+      .outputs = state->outputs,
+      .outputs_cap = sizeof state->outputs,
+  };
 }
 
-static void studio_columns_note_signature(studio_state *state)
+static studio_columns_config studio_eval_columns_config(studio_state *state)
 {
-  studio_columns *columns = &state->columns;
-  studio_copy_string(columns->path, sizeof columns->path, state->csv_path);
+  return (studio_columns_config){
+      .csv_path = state->eval_csv_path,
+      .delimiter = state->eval_delimiter,
+      .has_header = state->eval_has_header,
+      .inputs = state->eval_inputs,
+      .inputs_cap = sizeof state->eval_inputs,
+      .outputs = state->eval_targets,
+      .outputs_cap = sizeof state->eval_targets,
+  };
+}
+
+static bool studio_columns_signature_matches(
+    const studio_columns *columns, const studio_columns_config *config)
+{
+  return columns->checked && strcmp(columns->path, config->csv_path) == 0 &&
+         strcmp(columns->delimiter, config->delimiter) == 0 &&
+         columns->has_header == config->has_header;
+}
+
+static void studio_columns_note_signature(studio_columns *columns,
+                                          const studio_columns_config *config)
+{
+  studio_copy_string(columns->path, sizeof columns->path, config->csv_path);
   studio_copy_string(columns->delimiter, sizeof columns->delimiter,
-                     state->delimiter);
-  columns->has_header = state->has_header;
+                     config->delimiter);
+  columns->has_header = config->has_header;
   columns->checked = true;
 }
 
@@ -391,21 +532,21 @@ static bool studio_columns_join(const studio_columns *columns,
   return true;
 }
 
-static void studio_columns_sync_lists(studio_state *state)
+static void studio_columns_sync_lists(studio_columns *columns,
+                                      const studio_columns_config *config)
 {
-  studio_columns *columns = &state->columns;
   if (!columns->loaded) {
     return;
   }
 
   int input_count = 0;
   int output_count = 0;
-  const bool inputs_ok =
-      studio_columns_join(columns, columns->input_selected, state->inputs,
-                          sizeof state->inputs, &input_count);
-  const bool outputs_ok =
-      studio_columns_join(columns, columns->output_selected, state->outputs,
-                          sizeof state->outputs, &output_count);
+  const bool inputs_ok = studio_columns_join(
+      columns, columns->input_selected, config->inputs, config->inputs_cap,
+      &input_count);
+  const bool outputs_ok = studio_columns_join(
+      columns, columns->output_selected, config->outputs, config->outputs_cap,
+      &output_count);
   columns->truncated = !inputs_ok || !outputs_ok;
 
   int written = snprintf(columns->status, sizeof columns->status,
@@ -498,38 +639,40 @@ static void studio_columns_apply_list(const studio_columns *columns,
   }
 }
 
-static bool studio_columns_load(studio_state *state, bool force)
+static bool studio_columns_load_ex(studio_columns *columns,
+                                   const studio_columns_config *config,
+                                   bool force)
 {
-  studio_columns *columns = &state->columns;
-  if (!force && columns->loaded && studio_columns_signature_matches(state)) {
+  if (!force && columns->loaded &&
+      studio_columns_signature_matches(columns, config)) {
     return true;
   }
 
-  if (state->csv_path[0] == '\0') {
+  if (config->csv_path[0] == '\0') {
     studio_columns_release(columns);
     snprintf(columns->status, sizeof columns->status,
-             "Choose a training CSV to list its columns.");
+             "Choose a CSV to list its columns.");
     return false;
   }
 
-  const char delimiter = studio_delimiter_value(state->delimiter);
+  const char delimiter = studio_delimiter_value(config->delimiter);
   if (delimiter == '\0') {
     studio_columns_release(columns);
     snprintf(columns->status, sizeof columns->status,
              "Delimiter must be one character, or \\t for a tab.");
-    studio_columns_note_signature(state);
+    studio_columns_note_signature(columns, config);
     return false;
   }
 
   elml_csv header;
-  elml_status status = elml_csv_read_header(state->csv_path, delimiter,
+  elml_status status = elml_csv_read_header(config->csv_path, delimiter,
                                             &header);
   if (status != ELML_OK) {
     studio_columns_release(columns);
     snprintf(columns->status, sizeof columns->status,
-             "Could not read columns from %.300s (%.100s).", state->csv_path,
+             "Could not read columns from %.300s (%.100s).", config->csv_path,
              elml_error_string(status));
-    studio_columns_note_signature(state);
+    studio_columns_note_signature(columns, config);
     return false;
   }
   if (header.cols > (uint32_t)INT_MAX) {
@@ -537,7 +680,7 @@ static bool studio_columns_load(studio_state *state, bool force)
     studio_columns_release(columns);
     snprintf(columns->status, sizeof columns->status,
              "The CSV header has too many columns for the picker.");
-    studio_columns_note_signature(state);
+    studio_columns_note_signature(columns, config);
     return false;
   }
 
@@ -559,7 +702,7 @@ static bool studio_columns_load(studio_state *state, bool force)
   if (allocated) {
     for (int i = 0; i < count; ++i) {
       const char *cell = elml_csv_cell(&header, 0u, (uint32_t)i);
-      if (state->has_header && cell != nullptr && cell[0] != '\0') {
+      if (config->has_header && cell != nullptr && cell[0] != '\0') {
         const size_t length = strlen(cell);
         columns->names[i] = (char *)malloc(length + 1u);
         if (columns->names[i] == nullptr) {
@@ -590,19 +733,19 @@ static bool studio_columns_load(studio_state *state, bool force)
     studio_columns_release(columns);
     snprintf(columns->status, sizeof columns->status,
              "Out of memory while reading the CSV header.");
-    studio_columns_note_signature(state);
+    studio_columns_note_signature(columns, config);
     return false;
   }
 
   elml_csv_free(&header);
   columns->loaded = true;
-  studio_columns_note_signature(state);
+  studio_columns_note_signature(columns, config);
 
   columns->unresolved_inputs = 0;
   columns->unresolved_outputs = 0;
-  studio_columns_apply_list(columns, state->inputs, columns->input_selected,
+  studio_columns_apply_list(columns, config->inputs, columns->input_selected,
                             &columns->unresolved_inputs);
-  studio_columns_apply_list(columns, state->outputs, columns->output_selected,
+  studio_columns_apply_list(columns, config->outputs, columns->output_selected,
                             &columns->unresolved_outputs);
   /* Inputs win if a configuration names the same column twice. */
   for (int i = 0; i < columns->count; ++i) {
@@ -614,52 +757,92 @@ static bool studio_columns_load(studio_state *state, bool force)
          (size_t)columns->count * sizeof(bool));
   memcpy(columns->output_previous, columns->output_selected,
          (size_t)columns->count * sizeof(bool));
-  studio_columns_sync_lists(state);
+  studio_columns_sync_lists(columns, config);
   return true;
+}
+
+static bool studio_columns_load(studio_state *state, bool force)
+{
+  const studio_columns_config config = studio_training_columns_config(state);
+  return studio_columns_load_ex(&state->columns, &config, force);
+}
+
+static bool studio_eval_columns_load(studio_state *state, bool force)
+{
+  const studio_columns_config config = studio_eval_columns_config(state);
+  return studio_columns_load_ex(&state->eval_columns, &config, force);
+}
+
+static void studio_columns_sync_ex(studio_columns *columns,
+                                   const studio_columns_config *config)
+{
+  if (config->csv_path[0] == '\0' && !columns->loaded) {
+    return;
+  }
+  if (studio_columns_signature_matches(columns, config)) {
+    return;
+  }
+  (void)studio_columns_load_ex(columns, config, false);
 }
 
 static void studio_columns_sync(studio_state *state)
 {
-  if (state->csv_path[0] == '\0' && !state->columns.loaded) {
-    return;
-  }
-  if (studio_columns_signature_matches(state)) {
-    return;
-  }
-  (void)studio_columns_load(state, false);
+  const studio_columns_config config = studio_training_columns_config(state);
+  studio_columns_sync_ex(&state->columns, &config);
 }
 
-static bool studio_columns_validate(studio_state *state, char *error,
-                                    size_t cap)
+static void studio_eval_columns_sync(studio_state *state)
 {
-  if (!studio_columns_load(state, false)) {
+  const studio_columns_config config = studio_eval_columns_config(state);
+  const bool was_loaded = state->eval_columns.loaded;
+  const bool signature_differs =
+      was_loaded &&
+      !studio_columns_signature_matches(&state->eval_columns, &config);
+  studio_columns_sync_ex(&state->eval_columns, &config);
+  if (signature_differs && state->eval_has_result) {
+    elml_eval_free(&state->eval_result);
+    state->eval_has_result = false;
+    state->eval_ok = false;
+    state->eval_error[0] = '\0';
+    snprintf(state->eval_status, sizeof state->eval_status, "%s",
+             "The CSV or header changed; evaluate again to refresh the "
+             "results.");
+  }
+}
+
+static bool studio_columns_validate_ex(studio_columns *columns,
+                                       const studio_columns_config *config,
+                                       bool require_selection, char *error,
+                                       size_t cap)
+{
+  if (!studio_columns_load_ex(columns, config, false)) {
     studio_copy_string(error, cap,
-                       state->columns.status[0] != '\0'
-                           ? state->columns.status
+                       columns->status[0] != '\0'
+                           ? columns->status
                            : "Could not read the CSV header.");
     return false;
   }
 
   int input_count = 0;
   int output_count = 0;
-  for (int i = 0; i < state->columns.count; ++i) {
-    if (state->columns.input_selected[i]) {
+  for (int i = 0; i < columns->count; ++i) {
+    if (columns->input_selected[i]) {
       input_count++;
     }
-    if (state->columns.output_selected[i]) {
+    if (columns->output_selected[i]) {
       output_count++;
     }
   }
-  if (input_count == 0) {
+  if (require_selection && input_count == 0) {
     snprintf(error, cap, "Select at least one input column.");
     return false;
   }
-  if (output_count == 0) {
+  if (require_selection && output_count == 0) {
     snprintf(error, cap, "Select at least one output column.");
     return false;
   }
   const int unresolved =
-      state->columns.unresolved_inputs + state->columns.unresolved_outputs;
+      columns->unresolved_inputs + columns->unresolved_outputs;
   if (unresolved > 0) {
     snprintf(error, cap,
              "%d configured column%s not found in the CSV header. Choose "
@@ -667,9 +850,8 @@ static bool studio_columns_validate(studio_state *state, char *error,
              unresolved, (unresolved == 1) ? " was" : "s were");
     return false;
   }
-  for (int i = 0; i < state->columns.count; ++i) {
-    if (state->columns.input_selected[i] &&
-        state->columns.output_selected[i]) {
+  for (int i = 0; i < columns->count; ++i) {
+    if (columns->input_selected[i] && columns->output_selected[i]) {
       snprintf(error, cap,
                "Column %d is selected as both an input and an output. "
                "Choose each column for one side only.",
@@ -681,40 +863,46 @@ static bool studio_columns_validate(studio_state *state, char *error,
   /* The trainer resolves header names before numeric indices. If a selected
    * column's 1-based number is also a header name elsewhere, the emitted index
    * would name the wrong column. Refuse instead of training on bad data. */
-  if (state->columns.has_header) {
-    for (int i = 0; i < state->columns.count; ++i) {
-      if (!state->columns.input_selected[i] &&
-          !state->columns.output_selected[i]) {
+  if (columns->has_header) {
+    for (int i = 0; i < columns->count; ++i) {
+      if (!columns->input_selected[i] && !columns->output_selected[i]) {
         continue;
       }
       char token[16];
       snprintf(token, sizeof token, "%d", i + 1);
-      for (int j = 0; j < state->columns.count; ++j) {
-        if (j == i || state->columns.names[j] == nullptr) {
+      for (int j = 0; j < columns->count; ++j) {
+        if (j == i || columns->names[j] == nullptr) {
           continue;
         }
-        if (strcmp(state->columns.names[j], token) == 0) {
+        if (strcmp(columns->names[j], token) == 0) {
           snprintf(error, cap,
                    "Column %d is selected, but another header is literally "
                    "named \"%.100s\". Column numbers would be ambiguous; "
                    "rename that header.",
-                   i + 1, state->columns.names[j]);
+                   i + 1, columns->names[j]);
           return false;
         }
       }
     }
   }
 
-  if (!studio_columns_join(&state->columns, state->columns.input_selected,
-                           state->inputs, sizeof state->inputs, nullptr) ||
-      !studio_columns_join(&state->columns, state->columns.output_selected,
-                           state->outputs, sizeof state->outputs, nullptr)) {
+  if (!studio_columns_join(columns, columns->input_selected, config->inputs,
+                           config->inputs_cap, nullptr) ||
+      !studio_columns_join(columns, columns->output_selected, config->outputs,
+                           config->outputs_cap, nullptr)) {
     snprintf(error, cap,
              "Too many columns are selected to fit the configuration list. "
              "Choose fewer inputs or outputs.");
     return false;
   }
   return true;
+}
+
+static bool studio_columns_validate(studio_state *state, char *error,
+                                    size_t cap)
+{
+  const studio_columns_config config = studio_training_columns_config(state);
+  return studio_columns_validate_ex(&state->columns, &config, true, error, cap);
 }
 
 static int studio_activation_index(elml_activation activation)
@@ -777,11 +965,42 @@ static void studio_apply_config(studio_state *state, const elml_config *config)
     activation = studio_activation_index(config->activations[0]);
   }
   state->hidden_activation = activation;
+
+  /* Seed the Evaluate tab from the same file so a trained configuration can be
+   * checked against its CSV without retyping the columns. */
+  snprintf(state->eval_model_path, sizeof state->eval_model_path, "%s",
+           state->export_path);
+  snprintf(state->eval_csv_path, sizeof state->eval_csv_path, "%s",
+           state->csv_path);
+  snprintf(state->eval_inputs, sizeof state->eval_inputs, "%s", state->inputs);
+  snprintf(state->eval_targets, sizeof state->eval_targets, "%s",
+           state->outputs);
+  snprintf(state->eval_delimiter, sizeof state->eval_delimiter, "%s",
+           state->delimiter);
+  state->eval_has_header = state->has_header;
+  state->eval_score = state->outputs[0] != '\0';
+  state->eval_show_errors_only = false;
+  (void)studio_eval_columns_load(state, true);
+
+  elml_eval_free(&state->eval_result);
+  state->eval_has_result = false;
+  state->eval_ok = false;
+  state->eval_error[0] = '\0';
+  snprintf(state->eval_status, sizeof state->eval_status, "%s",
+           "Configuration loaded; evaluate when ready.");
 }
 
 static void studio_load_config(studio_state *state, bool quiet)
 {
   if (studio_is_running(state)) {
+    return;
+  }
+  if (studio_eval_running(state)) {
+    if (!quiet) {
+      studio_set_error(state,
+                       "Wait for the evaluation to finish before loading "
+                       "another configuration.");
+    }
     return;
   }
   if (state->config_path[0] == '\0') {
@@ -1058,7 +1277,7 @@ static void studio_progress(const elml_train_metrics *metrics, void *user)
   studio_unlock(state);
 }
 
-static int studio_worker(void *user)
+static void *studio_worker(void *user)
 {
   studio_state *state = (studio_state *)user;
   elml_training training;
@@ -1076,7 +1295,7 @@ static int studio_worker(void *user)
              "Could not prepare the training data.");
     studio_unlock(state);
     elml_training_destroy(&training);
-    return 0;
+    return NULL;
   }
 
   studio_lock(state);
@@ -1148,6 +1367,7 @@ static int studio_worker(void *user)
   state->finished = true;
   state->snap.finished = true;
   state->snap.exported = exported;
+  state->eval_seed_export = exported;
   state->snap.early_stopped = training.early_stopped;
   state->snap.stopped = training.stopped;
   state->snap.best_epoch = training.best_epoch;
@@ -1203,7 +1423,7 @@ static int studio_worker(void *user)
   studio_unlock(state);
 
   elml_training_destroy(&training);
-  return 0;
+  return NULL;
 }
 
 static void studio_start(studio_state *state)
@@ -1212,7 +1432,7 @@ static void studio_start(studio_state *state)
     return;
   }
   if (state->worker_started) {
-    (void)thrd_join(state->worker, nullptr);
+    (void)pthread_join(state->worker, nullptr);
     state->worker_started = false;
   }
 
@@ -1234,7 +1454,10 @@ static void studio_start(studio_state *state)
            config.export_path);
   studio_unlock(state);
 
-  if (thrd_create(&state->worker, studio_worker, state) != thrd_success) {
+  /* Wake the event-driven loop for the first snapshot. */
+  cui_request_redraw(cui_app_ui(state->app));
+
+  if (pthread_create(&state->worker, nullptr, studio_worker, state) != 0) {
     studio_lock(state);
     state->running = false;
     snprintf(state->snap.error, sizeof state->snap.error, "%s",
@@ -1266,8 +1489,208 @@ static void studio_shutdown(studio_state *state)
   }
   studio_unlock(state);
   if (state->worker_started) {
-    (void)thrd_join(state->worker, nullptr);
+    (void)pthread_join(state->worker, nullptr);
     state->worker_started = false;
+  }
+  if (state->eval_join_needed) {
+    (void)pthread_join(state->eval_worker, nullptr);
+    state->eval_join_needed = false;
+  }
+  elml_eval_free(&state->eval_result);
+  elml_eval_free(&state->eval_staging);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Evaluation worker                                                         */
+/* ------------------------------------------------------------------------- */
+
+[[gnu::format(printf, 3, 4)]]
+static void studio_eval_append(char *out, size_t cap, const char *format, ...)
+{
+  const size_t used = strlen(out);
+  if (used + 1u >= cap) {
+    return;
+  }
+  va_list args;
+  va_start(args, format);
+  (void)vsnprintf(out + used, cap - used, format, args);
+  va_end(args);
+}
+
+static void studio_eval_summary(const elml_eval_result *result, char *out,
+                                size_t cap)
+{
+  if (result == nullptr || out == nullptr || cap == 0u) {
+    return;
+  }
+  if (result->row_count == 0u) {
+    snprintf(out, cap, "%s", "No rows were evaluated.");
+  } else if (result->scored && result->classification) {
+    const double accuracy =
+        (result->scored_rows == 0u)
+            ? 0.0
+            : (double)result->correct / (double)result->scored_rows;
+    snprintf(out, cap, "%u rows checked: %llu correct (%.1f%%)",
+             result->row_count, (unsigned long long)result->correct,
+             accuracy * 100.0);
+  } else if (result->scored) {
+    snprintf(out, cap, "%u rows checked: MSE %.6f, MAE %.6f",
+             result->row_count, result->mse, result->mae);
+  } else {
+    snprintf(out, cap, "%u rows predicted (scoring is off).",
+             result->row_count);
+  }
+  if (result->skipped > 0u) {
+    studio_eval_append(out, cap, "; %llu skipped",
+                       (unsigned long long)result->skipped);
+  }
+}
+
+static void *studio_eval_worker(void *user)
+{
+  studio_state *state = (studio_state *)user;
+
+  const elml_eval_options options = {
+      .model_path = state->eval_model_path,
+      .csv_path = state->eval_csv_path,
+      .delimiter = studio_delimiter_value(state->eval_delimiter),
+      .has_header = state->eval_has_header,
+      .inputs = state->eval_inputs,
+      .targets = state->eval_targets,
+      .score = state->eval_score,
+      .skip_bad_rows = true,
+      .limit = 0u,
+  };
+
+  elml_eval_result result;
+  const elml_status status = elml_eval_run(&options, &result);
+
+  studio_lock(state);
+  /* Move ownership of every allocation to the UI thread. */
+  state->eval_staging = result;
+  state->eval_pending = true;
+  state->eval_running = false;
+  state->eval_ok = status == ELML_OK;
+  if (status == ELML_OK) {
+    state->eval_error[0] = '\0';
+    studio_eval_summary(&result, state->eval_status,
+                        sizeof state->eval_status);
+  } else {
+    snprintf(state->eval_error, sizeof state->eval_error, "%s",
+             (result.message[0] != '\0') ? result.message
+                                         : elml_error_string(status));
+    snprintf(state->eval_status, sizeof state->eval_status, "%s",
+             "Evaluation failed.");
+  }
+  studio_unlock(state);
+
+  cui_request_redraw(cui_app_ui(state->app));
+  return NULL;
+}
+
+static void studio_eval_start(studio_state *state)
+{
+  if (studio_eval_running(state)) {
+    return;
+  }
+  if (state->eval_join_needed) {
+    (void)pthread_join(state->eval_worker, nullptr);
+    state->eval_join_needed = false;
+  }
+
+  if (state->eval_model_path[0] == '\0') {
+    snprintf(state->eval_error, sizeof state->eval_error, "%s",
+             "Choose the saved model (.elml) to evaluate.");
+    return;
+  }
+  if (state->eval_csv_path[0] == '\0') {
+    snprintf(state->eval_error, sizeof state->eval_error, "%s",
+             "Choose the CSV file with the rows to check.");
+    return;
+  }
+  if (studio_delimiter_value(state->eval_delimiter) == '\0') {
+    snprintf(state->eval_error, sizeof state->eval_error, "%s",
+             "Delimiter must be one character, or \\t for a tab.");
+    return;
+  }
+
+  char column_error[320];
+  const studio_columns_config columns_config =
+      studio_eval_columns_config(state);
+  if (!studio_columns_validate_ex(&state->eval_columns, &columns_config, false,
+                                  column_error, sizeof column_error)) {
+    snprintf(state->eval_error, sizeof state->eval_error, "%.1000s",
+             column_error);
+    return;
+  }
+
+  studio_lock(state);
+  state->eval_running = true;
+  state->eval_ok = false;
+  state->eval_scroll_results = false;
+  state->eval_error[0] = '\0';
+  snprintf(state->eval_status, sizeof state->eval_status,
+           "Evaluating every row against the model...");
+  studio_unlock(state);
+
+  cui_request_redraw(cui_app_ui(state->app));
+
+  if (pthread_create(&state->eval_worker, nullptr, studio_eval_worker, state) !=
+      0) {
+    studio_lock(state);
+    state->eval_running = false;
+    snprintf(state->eval_error, sizeof state->eval_error, "%s",
+             "Could not create the evaluation thread.");
+    studio_unlock(state);
+    return;
+  }
+  state->eval_join_needed = true;
+}
+
+static void studio_eval_collect(studio_state *state)
+{
+  char seeded[STUDIO_PATH_MAX];
+  seeded[0] = '\0';
+  bool pending = false;
+  elml_eval_result incoming;
+  memset(&incoming, 0, sizeof incoming);
+
+  studio_lock(state);
+  if (state->eval_seed_export && !state->eval_running) {
+    state->eval_seed_export = false;
+    snprintf(seeded, sizeof seeded, "%s", state->snap.export_path);
+  }
+  if (state->eval_pending) {
+    incoming = state->eval_staging;
+    memset(&state->eval_staging, 0, sizeof state->eval_staging);
+    state->eval_pending = false;
+    pending = true;
+  }
+  studio_unlock(state);
+
+  if (seeded[0] != '\0') {
+    snprintf(state->eval_model_path, sizeof state->eval_model_path, "%s",
+             seeded);
+    if (!pending) {
+      elml_eval_free(&state->eval_result);
+      state->eval_has_result = false;
+      state->eval_ok = false;
+      state->eval_error[0] = '\0';
+      snprintf(state->eval_status, sizeof state->eval_status,
+               "A new model was exported; evaluate it to check the CSV.");
+    }
+  }
+
+  if (pending) {
+    elml_eval_free(&state->eval_result);
+    state->eval_result = incoming;
+    state->eval_has_result = true;
+    state->eval_scroll_results = state->eval_ok;
+  }
+
+  if (state->eval_join_needed) {
+    (void)pthread_join(state->eval_worker, nullptr);
+    state->eval_join_needed = false;
   }
 }
 
@@ -1363,69 +1786,92 @@ static void studio_number_field(cui_ctx *ui, const char *id, const char *label,
   }
 }
 
-static void studio_column_picker(cui_ctx *ui, studio_state *state,
-                                 bool running)
+typedef struct studio_picker_text {
+  const char *id_prefix;
+  const char *inputs_label;
+  const char *outputs_label;
+  const char *inputs_placeholder;
+  const char *outputs_placeholder;
+  const char *inputs_tooltip;
+  const char *outputs_tooltip;
+  const char *inputs_text_hint;
+  const char *outputs_text_hint;
+  const char *empty_hint;
+  bool allow_text;
+} studio_picker_text;
+
+static bool studio_column_picker_ex(cui_ctx *ui, studio_columns *columns,
+                                    const studio_columns_config *config,
+                                    bool running,
+                                    const studio_picker_text *text)
 {
-  studio_columns *columns = &state->columns;
+  if (columns->loaded &&
+      !studio_columns_signature_matches(columns, config)) {
+    cui_muted(ui, "Reading the CSV header...");
+    return false;
+  }
 
   if (!columns->loaded) {
-    studio_text_field(ui, "inputs", "Input columns", state->inputs,
-                      sizeof state->inputs, "sepal_length,sepal_width,...",
-                      "Column names are matched against the CSV header. The "
-                      "picker appears once the file can be read.",
-                      "Comma-separated feature columns; names match the CSV "
-                      "header, or 1-based numbers for headerless files.",
-                      running);
-    studio_text_field(ui, "outputs", "Output column(s)", state->outputs,
-                      sizeof state->outputs, "species",
-                      "One name for classification, or a comma-separated "
-                      "list for regression.",
-                      "Target column(s); names match the CSV header, or "
-                      "1-based numbers for headerless files.",
-                      running);
-    if (cui_button(ui, "Read CSV columns", .icon = CUI_ICON_REFRESH_CW,
+    if (text->allow_text) {
+      char input_id[64];
+      char output_id[64];
+      snprintf(input_id, sizeof input_id, "%s_inputs_text", text->id_prefix);
+      snprintf(output_id, sizeof output_id, "%s_outputs_text",
+               text->id_prefix);
+      studio_text_field(ui, input_id, text->inputs_label, config->inputs,
+                        config->inputs_cap, "sepal_length,sepal_width,...",
+                        text->inputs_text_hint, text->inputs_tooltip, running);
+      studio_text_field(ui, output_id, text->outputs_label, config->outputs,
+                        config->outputs_cap, "species",
+                        text->outputs_text_hint, text->outputs_tooltip,
+                        running);
+    } else {
+      cui_muted(ui, text->empty_hint);
+    }
+    if (config->csv_path[0] != '\0' &&
+        cui_button(ui, "Read CSV columns", .icon = CUI_ICON_REFRESH_CW,
                    .variant = CUI_BUTTON_GHOST, .size = CUI_SIZE_SM,
                    .tooltip = "Read the first CSV row and populate the column "
                               "pickers",
                    .disabled = running)) {
-      (void)studio_columns_load(state, true);
+      (void)studio_columns_load_ex(columns, config, true);
     }
     if (columns->status[0] != '\0') {
       cui_muted(ui, columns->status);
     }
-    return;
+    return false;
   }
 
   const bool searchable = columns->count > 8;
   bool inputs_changed = false;
   bool outputs_changed = false;
+  bool reloaded = false;
+
+  char inputs_id[64];
+  char outputs_id[64];
+  snprintf(inputs_id, sizeof inputs_id, "%s_inputs", text->id_prefix);
+  snprintf(outputs_id, sizeof outputs_id, "%s_outputs", text->id_prefix);
 
   cui_disabled_scope(ui, running) {
     inputs_changed = cui_multi_select_ex(
-        ui, "column_inputs", (const char *const *)columns->labels,
-        columns->count, columns->input_selected,
-        &(cui_multi_select_opts){
-            .label = "Input columns",
-            .placeholder = "Choose one or more inputs",
-            .searchable = searchable,
-            .max_chips = 2,
-            .width = CUI_FILL});
-    cui_tooltip(ui,
-                "Feature columns for the model. Choosing one here removes it "
-                "from the outputs.");
+        ui, inputs_id, (const char *const *)columns->labels, columns->count,
+        columns->input_selected,
+        &(cui_multi_select_opts){.label = text->inputs_label,
+                                 .placeholder = text->inputs_placeholder,
+                                 .searchable = searchable,
+                                 .max_chips = 2,
+                                 .width = CUI_FILL});
+    cui_tooltip(ui, text->inputs_tooltip);
 
     outputs_changed = cui_multi_select_ex(
-        ui, "column_outputs", (const char *const *)columns->labels,
-        columns->count, columns->output_selected,
-        &(cui_multi_select_opts){
-            .label = "Output column(s)",
-            .placeholder = "Choose the target columns",
-            .searchable = searchable,
-            .max_chips = 2,
-            .width = CUI_FILL});
-    cui_tooltip(ui,
-                "Target columns for the model. Choosing one here removes it "
-                "from the inputs.");
+        ui, outputs_id, (const char *const *)columns->labels, columns->count,
+        columns->output_selected,
+        &(cui_multi_select_opts){.label = text->outputs_label,
+                                 .placeholder = text->outputs_placeholder,
+                                 .searchable = searchable,
+                                 .max_chips = 2,
+                                 .width = CUI_FILL});
+    cui_tooltip(ui, text->outputs_tooltip);
   }
 
   if (inputs_changed) {
@@ -1449,7 +1895,7 @@ static void studio_column_picker(cui_ctx *ui, studio_state *state,
     if (outputs_changed) {
       columns->unresolved_outputs = 0;
     }
-    studio_columns_sync_lists(state);
+    studio_columns_sync_lists(columns, config);
   }
   memcpy(columns->input_previous, columns->input_selected,
          (size_t)columns->count * sizeof(bool));
@@ -1460,11 +1906,36 @@ static void studio_column_picker(cui_ctx *ui, studio_state *state,
                  .variant = CUI_BUTTON_GHOST, .size = CUI_SIZE_SM,
                  .tooltip = "Re-read the CSV header after editing the file",
                  .disabled = running)) {
-    (void)studio_columns_load(state, true);
+    reloaded = studio_columns_load_ex(columns, config, true);
   }
   if (columns->status[0] != '\0') {
     cui_muted(ui, columns->status);
   }
+  return inputs_changed || outputs_changed || reloaded;
+}
+
+static void studio_column_picker(cui_ctx *ui, studio_state *state,
+                                 bool running)
+{
+  const studio_columns_config config = studio_training_columns_config(state);
+  const studio_picker_text text = {
+      .id_prefix = "column",
+      .inputs_label = "Input columns",
+      .outputs_label = "Output column(s)",
+      .inputs_placeholder = "Choose one or more inputs",
+      .outputs_placeholder = "Choose the target columns",
+      .inputs_tooltip = "Feature columns for the model. Choosing one here "
+                        "removes it from the outputs.",
+      .outputs_tooltip = "Target columns for the model. Choosing one here "
+                         "removes it from the inputs.",
+      .inputs_text_hint = "Column names are matched against the CSV header. "
+                          "The picker appears once the file can be read.",
+      .outputs_text_hint = "One name for classification, or a comma-separated "
+                           "list for regression.",
+      .empty_hint = "Choose a training CSV to list its columns.",
+      .allow_text = true,
+  };
+  (void)studio_column_picker_ex(ui, &state->columns, &config, running, &text);
 }
 
 static bool studio_sidebar(cui_ctx *ui, studio_state *state, bool running)
@@ -1582,10 +2053,14 @@ static bool studio_sidebar(cui_ctx *ui, studio_state *state, bool running)
                        .disabled = running);
       cui_tooltip(ui, "Objective the network minimizes. It also chooses the "
                       "output activation.");
-      (void)cui_select(ui, "optimizer", studio_optimizer_labels,
-                       STUDIO_COUNT(studio_optimizer_labels),
-                       &state->optimizer_index, .label = "Optimizer",
-                       .width = CUI_FILL, .disabled = running);
+      cui_text(ui, "Optimizer", .size = 12,
+               .color = CUI_COLOR_TEXT_SECONDARY);
+      cui_disabled_scope(ui, running) {
+        (void)cui_segmented(ui, "optimizer", studio_optimizer_labels,
+                            STUDIO_COUNT(studio_optimizer_labels),
+                            &state->optimizer_index, .full_width = true,
+                            .size = CUI_SIZE_SM);
+      }
       cui_tooltip(ui, "Weight update rule used during training.");
       cui_muted(ui, "The output activation follows the loss: softmax for "
                     "cross entropy, linear otherwise.");
@@ -1675,6 +2150,12 @@ static void studio_metrics(cui_ctx *ui, const studio_view *view)
   char loss_value[48];
   char accuracy_value[48];
   char best_value[48];
+  char loss_delta_label[64] = "";
+  char accuracy_delta_label[64] = "";
+  float loss_delta = 0.0f;
+  float accuracy_delta = 0.0f;
+  bool has_loss_delta = false;
+  bool has_accuracy_delta = false;
 
   if (view->snap.epoch > 0u) {
     snprintf(epoch_value, sizeof epoch_value, "%u", view->snap.epoch);
@@ -1682,13 +2163,13 @@ static void studio_metrics(cui_ctx *ui, const studio_view *view)
     snprintf(epoch_value, sizeof epoch_value, "%s", "-");
   }
   if (view->snap.epoch > 0u) {
-    snprintf(loss_value, sizeof loss_value, "%.4f",
+    snprintf(loss_value, sizeof loss_value, "%.3f",
              (double)view->snap.loss);
   } else {
     snprintf(loss_value, sizeof loss_value, "%s", "-");
   }
   if (view->snap.epoch > 0u && view->snap.has_accuracy) {
-    snprintf(accuracy_value, sizeof accuracy_value, "%.2f%%",
+    snprintf(accuracy_value, sizeof accuracy_value, "%.1f%%",
              (double)view->snap.accuracy * 100.0);
   } else {
     snprintf(accuracy_value, sizeof accuracy_value, "%s", "-");
@@ -1699,24 +2180,48 @@ static void studio_metrics(cui_ctx *ui, const studio_view *view)
     snprintf(best_value, sizeof best_value, "%s", "-");
   }
 
+  if (view->history_count > 1) {
+    const int last = view->history_count - 1;
+    const float previous_loss = studio_draw_loss[last - 1];
+    const float current_loss = studio_draw_loss[last];
+    if (previous_loss > 0.0f) {
+      loss_delta = (current_loss - previous_loss) / previous_loss * 100.0f;
+      snprintf(loss_delta_label, sizeof loss_delta_label, "%+.1f%%",
+               (double)loss_delta);
+      has_loss_delta = true;
+    }
+    if (view->has_accuracy_history) {
+      const float previous_accuracy = studio_draw_accuracy[last - 1];
+      const float current_accuracy = studio_draw_accuracy[last];
+      accuracy_delta = (current_accuracy - previous_accuracy) * 100.0f;
+      snprintf(accuracy_delta_label, sizeof accuracy_delta_label, "%+.2f pp",
+               (double)accuracy_delta);
+      has_accuracy_delta = true;
+    }
+  }
+
   const int spark_count = view->history_count;
   const float *loss_spark = (spark_count > 1) ? studio_draw_loss : nullptr;
   const float *accuracy_spark =
       (spark_count > 1 && view->has_accuracy_history) ? studio_draw_accuracy
                                                      : nullptr;
 
-  cui_row(ui, .width = CUI_FILL, .wrap = true, .gap = 12) {
-    cui_metric(ui, "Epoch", epoch_value, .icon = CUI_ICON_ACTIVITY,
-               .width = CUI_GROW(1));
+  cui_box(ui, .dir = CUI_GRID, .columns = 4, .min_column_width = 150,
+          .gap = 12) {
+    cui_metric(ui, "Epoch", epoch_value, .icon = CUI_ICON_ACTIVITY);
     cui_metric(ui, "Val loss", loss_value,
-               .icon = CUI_ICON_TRENDING_DOWN, .width = CUI_GROW(1),
+               .icon = CUI_ICON_TRENDING_DOWN,
                .spark = loss_spark, .spark_count = spark_count,
-               .lower_is_better = true);
+               .lower_is_better = true,
+               .delta = has_loss_delta ? loss_delta : 0.0f,
+               .delta_label = has_loss_delta ? loss_delta_label : nullptr);
     cui_metric(ui, "Accuracy", accuracy_value, .icon = CUI_ICON_TARGET,
-               .width = CUI_GROW(1), .spark = accuracy_spark,
-               .spark_count = accuracy_spark != nullptr ? spark_count : 0);
-    cui_metric(ui, "Best epoch", best_value, .icon = CUI_ICON_ZAP,
-               .width = CUI_GROW(1));
+               .spark = accuracy_spark,
+               .spark_count = accuracy_spark != nullptr ? spark_count : 0,
+               .delta = has_accuracy_delta ? accuracy_delta : 0.0f,
+               .delta_label =
+                   has_accuracy_delta ? accuracy_delta_label : nullptr);
+    cui_metric(ui, "Best epoch", best_value, .icon = CUI_ICON_ZAP);
   }
 }
 
@@ -1748,20 +2253,27 @@ static void studio_progress_card(cui_ctx *ui, const studio_view *view)
   }
 
   cui_card(ui, .width = CUI_FILL, .gap = 10) {
-    cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER, .gap = 10) {
-      cui_text(ui, label, .font = CUI_FONT_MEDIUM);
-      cui_spacer(ui);
-      if (view->running) {
-        cui_spinner(ui, 16.0f);
+    cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER, .gap = 18) {
+      cui_column(ui, .width = CUI_FILL, .gap = 10) {
+        cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER, .gap = 10) {
+          cui_text(ui, label, .font = CUI_FONT_MEDIUM);
+          cui_spacer(ui);
+          if (view->running) {
+            cui_spinner(ui, 16.0f);
+          }
+        }
+        cui_progress(ui, fraction,
+                     .tone = (view->snap.stopped || view->snap.early_stopped)
+                                 ? CUI_TONE_WARNING
+                                 : CUI_TONE_ACCENT,
+                     .height = 10.0f);
+        if (view->snap.status[0] != '\0') {
+          cui_secondary(ui, view->snap.status);
+        }
       }
-    }
-    cui_progress(ui, fraction,
-                 .tone = (view->snap.stopped || view->snap.early_stopped)
-                             ? CUI_TONE_WARNING
-                             : CUI_TONE_ACCENT,
-                 .height = 10.0f);
-    if (view->snap.status[0] != '\0') {
-      cui_secondary(ui, view->snap.status);
+      if (view->snap.epochs > 0u) {
+        cui_progress_ring(ui, "Done", fraction, 74.0f);
+      }
     }
   }
 }
@@ -1788,6 +2300,164 @@ static void studio_chart(cui_ctx *ui, const char *title, const char *subtitle,
       cui_line_chart(ui, id, series, 1, .height = 210.0f, .area = true,
                      .smooth = true, .format = format, .no_legend = true);
     }
+  }
+}
+
+static void studio_data_split(cui_ctx *ui, const studio_view *view)
+{
+  const uint32_t train_rows = view->snap.train_rows;
+  const uint32_t val_rows = view->snap.val_rows;
+  const uint32_t total_rows = train_rows + val_rows;
+
+  cui_card(ui, .width = CUI_FILL, .gap = 12) {
+    cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER) {
+      cui_text(ui, "Data split", .font = CUI_FONT_MEDIUM, .size = 15);
+      cui_spacer(ui);
+      if (total_rows > 0u) {
+        char ratio[40];
+        const double percent =
+            (double)train_rows / (double)total_rows * 100.0;
+        snprintf(ratio, sizeof ratio, "%.0f%% train", percent);
+        cui_badge(ui, ratio, .tone = CUI_TONE_NEUTRAL,
+                  .size = CUI_SIZE_SM);
+      }
+    }
+
+    if (total_rows == 0u) {
+      cui_text(ui, "Train and validation rows appear after the data loads.",
+               .size = 12, .color = CUI_COLOR_TEXT_MUTED);
+    } else {
+      float values[2] = {(float)train_rows, (float)val_rows};
+      const char *labels[2] = {"Train", "Validation"};
+      cui_donut_chart(ui, "data_split_chart", values, labels, 2,
+                      .height = 150.0f, .width = CUI_FILL);
+      char rows[128];
+      snprintf(rows, sizeof rows, "%u train / %u validation rows",
+               train_rows, val_rows);
+      cui_muted(ui, rows);
+      if (view->snap.input_dim > 0u && view->snap.output_dim > 0u) {
+        char shape[64];
+        snprintf(shape, sizeof shape, "%u inputs to %u outputs",
+                 view->snap.input_dim, view->snap.output_dim);
+        cui_muted(ui, shape);
+      }
+    }
+  }
+}
+
+static void studio_log_item(cui_ctx *ui, int index, int count,
+                            const char *title, const char *time,
+                            const char *description, const char *icon,
+                            cui_tone tone)
+{
+  cui_timeline_item(ui, title, .time = time, .description = description,
+                    .icon = icon, .tone = tone, .last = index == count - 1);
+}
+
+static void studio_run_log(cui_ctx *ui, const studio_view *view)
+{
+  const studio_snapshot *snap = &view->snap;
+  int count = 1; /* configuration is always present */
+  if (snap->prepared) {
+    count++;
+  }
+  if (snap->epoch > 0u) {
+    count++;
+  }
+  if (snap->best_epoch > 0u) {
+    count++;
+  }
+  if (snap->early_stopped || snap->stopped) {
+    count++;
+  }
+  if (snap->exported) {
+    count++;
+  }
+  if (snap->error[0] != '\0') {
+    count++;
+  }
+
+  cui_card(ui, .width = CUI_FILL, .gap = 14) {
+    cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER) {
+      cui_text(ui, "Run log", .font = CUI_FONT_MEDIUM, .size = 15);
+      cui_spacer(ui);
+      if (snap->error[0] != '\0') {
+        cui_badge(ui, "Error", .tone = CUI_TONE_DANGER, .dot = true);
+      } else if (snap->exported) {
+        cui_badge(ui, "Exported", .tone = CUI_TONE_SUCCESS, .dot = true);
+      } else if (snap->early_stopped || snap->stopped) {
+        cui_badge(ui, "Stopped", .tone = CUI_TONE_WARNING, .dot = true);
+      } else if (view->running) {
+        cui_badge(ui, "Training", .tone = CUI_TONE_INFO, .dot = true);
+      } else {
+        cui_badge(ui, "Ready", .tone = CUI_TONE_NEUTRAL, .dot = true);
+      }
+    }
+
+    int index = 0;
+    if (snap->error[0] != '\0') {
+      studio_log_item(ui, index++, count, "Run failed", nullptr,
+                      "See the error details below.", CUI_ICON_TRIANGLE_ALERT,
+                      CUI_TONE_DANGER);
+    }
+    if (snap->exported) {
+      studio_log_item(ui, index++, count, "Model exported", "done",
+                      snap->export_path[0] != '\0' ? snap->export_path
+                                                   : "Weights written",
+                      CUI_ICON_DOWNLOAD, CUI_TONE_SUCCESS);
+    }
+    if (snap->early_stopped || snap->stopped) {
+      char time[32];
+      if (snap->best_epoch > 0u) {
+        snprintf(time, sizeof time, "epoch %u", snap->best_epoch);
+      } else {
+        snprintf(time, sizeof time, "%s", "stopped");
+      }
+      studio_log_item(ui, index++, count,
+                      snap->early_stopped ? "Early stopping" : "Stopped",
+                      time,
+                      snap->early_stopped
+                          ? "No validation improvement inside the patience "
+                            "window."
+                          : "Training stopped; the best epoch was restored.",
+                      CUI_ICON_SQUARE, CUI_TONE_WARNING);
+    }
+    if (snap->best_epoch > 0u) {
+      char time[32];
+      char description[96];
+      snprintf(time, sizeof time, "epoch %u", snap->best_epoch);
+      snprintf(description, sizeof description, "Validation loss %.4f",
+               (double)snap->best_loss);
+      studio_log_item(ui, index++, count, "Best validation", time,
+                      description, CUI_ICON_STAR, CUI_TONE_ACCENT);
+    }
+    if (snap->epoch > 0u) {
+      char time[48];
+      char description[160];
+      snprintf(time, sizeof time, "%u / %u", snap->epoch, snap->epochs);
+      if (snap->has_accuracy) {
+        snprintf(description, sizeof description,
+                 "loss %.4f, accuracy %.2f%%", (double)snap->loss,
+                 (double)snap->accuracy * 100.0);
+      } else {
+        snprintf(description, sizeof description, "loss %.4f",
+                 (double)snap->loss);
+      }
+      studio_log_item(ui, index++, count, "Training", time, description,
+                      CUI_ICON_ACTIVITY, CUI_TONE_INFO);
+    }
+    if (snap->prepared) {
+      char description[128];
+      snprintf(description, sizeof description,
+               "%u train / %u validation rows", snap->train_rows,
+               snap->val_rows);
+      studio_log_item(ui, index++, count, "Data ready", nullptr, description,
+                      CUI_ICON_DATABASE, CUI_TONE_SUCCESS);
+    }
+    studio_log_item(ui, index++, count, "Configuration ready", nullptr,
+                    snap->status[0] != '\0' ? snap->status
+                                            : "Settings loaded.",
+                    CUI_ICON_CHECK, CUI_TONE_NEUTRAL);
   }
 }
 
@@ -1862,31 +2532,655 @@ static void studio_run_details(cui_ctx *ui, studio_state *state,
   }
 }
 
-static void studio_main(cui_ctx *ui, studio_state *state,
-                        const studio_view *view)
+/* ------------------------------------------------------------------------- */
+/* Evaluate tab                                                              */
+/* ------------------------------------------------------------------------- */
+
+static void studio_eval_vector_text(const float *values, uint32_t count,
+                                    char *out, size_t cap)
 {
-  cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
-             .bg = CUI_COLOR_BACKGROUND) {
-    cui_row(ui, .width = CUI_FILL, .pad_x = 24, .pad_y = 16, .gap = 12,
-            .align = CUI_ALIGN_CENTER) {
+  if (out == nullptr || cap == 0u) {
+    return;
+  }
+  if (values == nullptr) {
+    snprintf(out, cap, "%s", "-");
+    return;
+  }
+  out[0] = '\0';
+  size_t used = 0u;
+  for (uint32_t i = 0u; i < count; ++i) {
+    const int written = snprintf(out + used, cap - used, "%s%.4f",
+                                 (i == 0u) ? "" : ", ", (double)values[i]);
+    if (written < 0 || (size_t)written >= cap - used) {
+      out[cap - 1u] = '\0';
+      return;
+    }
+    used += (size_t)written;
+  }
+}
+
+static void studio_eval_error_text(const elml_eval_result *result,
+                                   const elml_eval_row *row, char *out,
+                                   size_t cap)
+{
+  const uint32_t index = (uint32_t)(row - result->rows);
+  const float *values = elml_eval_values(result, index);
+  const float *targets = elml_eval_targets(result, index);
+  if (out == nullptr || cap == 0u) {
+    return;
+  }
+  if (values == nullptr || targets == nullptr) {
+    snprintf(out, cap, "%s", "-");
+    return;
+  }
+  out[0] = '\0';
+  size_t used = 0u;
+  for (uint32_t i = 0u; i < result->output_dim; ++i) {
+    const int written =
+        snprintf(out + used, cap - used, "%s%.4f", (i == 0u) ? "" : ", ",
+                 fabs((double)values[i] - (double)targets[i]));
+    if (written < 0 || (size_t)written >= cap - used) {
+      out[cap - 1u] = '\0';
+      return;
+    }
+    used += (size_t)written;
+  }
+}
+
+static void studio_eval_save(studio_state *state)
+{
+  if (!state->eval_has_result) {
+    return;
+  }
+  char picked[STUDIO_PATH_MAX];
+  picked[0] = '\0';
+  if (!cui_app_file_dialog(
+          state->app,
+          &(cui_file_dialog_opts){.kind = CUI_FILE_SAVE,
+                                  .title = "Save predictions",
+                                  .filter_name = "CSV files",
+                                  .filter = "csv",
+                                  .default_name = "predictions.csv"},
+          picked, sizeof picked)) {
+    return;
+  }
+
+  const elml_status status = elml_eval_write_csv(&state->eval_result, picked);
+  if (status == ELML_OK) {
+    state->eval_error[0] = '\0';
+    snprintf(state->eval_status, sizeof state->eval_status,
+             "Saved %u rows with predictions to %.360s",
+             state->eval_result.row_count, picked);
+  } else {
+    snprintf(state->eval_error, sizeof state->eval_error,
+             "Could not write %.800s (%.100s).", picked,
+             elml_error_string(status));
+  }
+}
+
+static bool studio_eval_controls(cui_ctx *ui, studio_state *state)
+{
+  const bool running = studio_eval_running(state);
+  bool load_config = false;
+
+  cui_card(ui, .width = CUI_FILL, .gap = 12) {
+    cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER) {
       cui_column(ui, .gap = 2) {
-        cui_heading(ui, "Training run", 2);
-        cui_secondary(ui, "Adjust parameters on the left; the charts follow "
-                          "each epoch.");
+        cui_text(ui, "Check a saved model", .font = CUI_FONT_MEDIUM,
+                 .size = 15);
+        cui_secondary(ui, "Runs every row through the exported model and "
+                          "reports what it predicted.");
       }
       cui_spacer(ui);
-      if (view->running) {
-        cui_badge(ui, "Training", .tone = CUI_TONE_INFO, .dot = true);
-      } else if (view->snap.error[0] != '\0') {
+      if (running) {
+        cui_badge(ui, "Evaluating", .tone = CUI_TONE_INFO, .dot = true);
+      } else if (state->eval_error[0] != '\0') {
         cui_badge(ui, "Needs attention", .tone = CUI_TONE_DANGER, .dot = true);
-      } else if (view->snap.stopped) {
-        cui_badge(ui, "Stopped", .tone = CUI_TONE_WARNING, .dot = true);
-      } else if (view->snap.early_stopped) {
-        cui_badge(ui, "Early stop", .tone = CUI_TONE_WARNING, .dot = true);
-      } else if (view->snap.exported) {
+      } else if (state->eval_has_result) {
         cui_badge(ui, "Complete", .tone = CUI_TONE_SUCCESS, .dot = true);
       } else {
         cui_badge(ui, "Idle", .tone = CUI_TONE_NEUTRAL, .dot = true);
+      }
+    }
+
+    cui_row(ui, .width = CUI_FILL, .gap = 8, .align = CUI_ALIGN_END) {
+      (void)cui_input(ui, "eval_config_path", state->config_path,
+                      sizeof state->config_path,
+                      .label = "Config file (.ini, optional)",
+                      .width = CUI_FILL, .disabled = running);
+      cui_tooltip(ui, "Load the same .ini used for training to fill the model, "
+                      "CSV, columns, header and delimiter below.");
+      if (cui_icon_button(ui, CUI_ICON_FOLDER_OPEN, .disabled = running,
+                          .tooltip = "Browse for an .ini file")) {
+        char picked[STUDIO_PATH_MAX];
+        picked[0] = '\0';
+        if (cui_app_file_dialog(
+                state->app,
+                &(cui_file_dialog_opts){.kind = CUI_FILE_OPEN,
+                                        .title = "Open training configuration",
+                                        .filter_name = "INI files",
+                                        .filter = "ini"},
+                picked, sizeof picked)) {
+          snprintf(state->config_path, sizeof state->config_path, "%s",
+                   picked);
+        }
+      }
+      if (cui_button(ui, "Load", .icon = CUI_ICON_REFRESH_CW,
+                     .variant = CUI_BUTTON_GHOST, .size = CUI_SIZE_SM,
+                     .disabled = running,
+                     .tooltip = "Fill the fields below from this .ini")) {
+        if (state->config_path[0] == '\0') {
+          snprintf(state->eval_error, sizeof state->eval_error, "%s",
+                   "Choose an .ini configuration file first.");
+        } else {
+          load_config = true;
+        }
+      }
+    }
+
+    studio_path_field(ui, state, "eval_model_path", "Saved model (.elml)",
+                      state->eval_model_path, sizeof state->eval_model_path,
+                      CUI_FILE_OPEN, "embedlml models", "elml",
+                      "The model exported by training, or any other .elml.",
+                      running);
+    studio_path_field(ui, state, "eval_csv_path", "CSV to check",
+                      state->eval_csv_path, sizeof state->eval_csv_path,
+                      CUI_FILE_OPEN, "CSV files", "csv",
+                      "Every data row in this file is passed through the "
+                      "model. The training CSV works when the model knows its "
+                      "columns.",
+                      running);
+
+    cui_row(ui, .width = CUI_FILL, .gap = 12, .align = CUI_ALIGN_END,
+            .wrap = true) {
+      if (cui_button(ui, "Use training data & export",
+                     .icon = CUI_ICON_REFRESH_CW, .variant = CUI_BUTTON_GHOST,
+                     .size = CUI_SIZE_SM, .disabled = running,
+                     .tooltip = "Copy the training CSV, exported model path "
+                                "and column selection into this tab")) {
+        if (state->snap.export_path[0] != '\0') {
+          snprintf(state->eval_model_path, sizeof state->eval_model_path, "%s",
+                   state->snap.export_path);
+        } else if (state->export_path[0] != '\0') {
+          snprintf(state->eval_model_path, sizeof state->eval_model_path, "%s",
+                   state->export_path);
+        }
+        snprintf(state->eval_csv_path, sizeof state->eval_csv_path, "%s",
+                 state->csv_path);
+        snprintf(state->eval_inputs, sizeof state->eval_inputs, "%s",
+                 state->inputs);
+        snprintf(state->eval_targets, sizeof state->eval_targets, "%s",
+                 state->outputs);
+        snprintf(state->eval_delimiter, sizeof state->eval_delimiter, "%s",
+                 state->delimiter);
+        state->eval_has_header = state->has_header;
+        state->eval_score = true;
+        state->eval_show_errors_only = false;
+        (void)studio_eval_columns_load(state, true);
+        elml_eval_free(&state->eval_result);
+        state->eval_has_result = false;
+        state->eval_ok = false;
+        state->eval_error[0] = '\0';
+        snprintf(state->eval_status, sizeof state->eval_status, "%s",
+                 "Training data selected; evaluate when ready.");
+      }
+      cui_spacer(ui);
+      (void)cui_input(ui, "eval_delimiter", state->eval_delimiter,
+                      sizeof state->eval_delimiter, .label = "Delimiter",
+                      .width = CUI_PX(110), .disabled = running);
+      cui_tooltip(ui, "Field separator in the evaluation CSV: one character, "
+                      "or \\t for a tab.");
+    }
+
+    cui_row(ui, .width = CUI_FILL, .gap = 18, .wrap = true) {
+      (void)cui_switch(ui, "CSV has a header", &state->eval_has_header,
+                       .disabled = running);
+      cui_tooltip(ui, "Skip the first row when reading the evaluation CSV.");
+      (void)cui_switch(ui, "Score against targets", &state->eval_score,
+                       .disabled = running);
+      cui_tooltip(ui, "Compare each prediction with the target column to count "
+                      "correct rows or regression error. Turn it off to only "
+                      "list predictions.");
+    }
+
+    const studio_columns_config columns_config =
+        studio_eval_columns_config(state);
+    const studio_picker_text column_text = {
+        .id_prefix = "eval_column",
+        .inputs_label = "Input columns",
+        .outputs_label = "Target column(s)",
+        .inputs_placeholder = "Choose one or more inputs",
+        .outputs_placeholder = "Choose the target columns",
+        .inputs_tooltip = "Feature columns in the evaluation CSV, in model "
+                          "input order. Choosing one here removes it from the "
+                          "targets.",
+        .outputs_tooltip = "Columns compared with the predictions. Choosing "
+                           "one here removes it from the inputs.",
+        .inputs_text_hint = "",
+        .outputs_text_hint = "",
+        .empty_hint = "Choose the CSV to check to list its columns. Leaving "
+                      "both empty uses the columns stored in the model.",
+        .allow_text = false,
+    };
+    if (studio_column_picker_ex(ui, &state->eval_columns, &columns_config,
+                                running, &column_text) &&
+        state->eval_has_result) {
+      elml_eval_free(&state->eval_result);
+      state->eval_has_result = false;
+      state->eval_ok = false;
+      state->eval_error[0] = '\0';
+      snprintf(state->eval_status, sizeof state->eval_status, "%s",
+               "Columns changed; evaluate again to refresh the results.");
+    }
+
+    cui_row(ui, .width = CUI_FILL, .gap = 10, .align = CUI_ALIGN_CENTER,
+            .wrap = true) {
+      if (cui_button(ui, running ? "Evaluating..." : "Evaluate CSV",
+                     .variant = CUI_BUTTON_PRIMARY,
+                     .icon = running ? CUI_ICON_LOADER_CIRCLE : CUI_ICON_PLAY,
+                     .loading = running, .disabled = running,
+                     .tooltip = "Run every row through the model in the "
+                                "background")) {
+        studio_eval_start(state);
+      }
+      if (state->eval_has_result && !running) {
+        if (cui_button(ui, "Save predictions", .variant = CUI_BUTTON_OUTLINE,
+                       .icon = CUI_ICON_SAVE, .size = CUI_SIZE_SM,
+                       .tooltip = "Write the CSV columns plus the predictions "
+                                  "to a new file")) {
+          studio_eval_save(state);
+        }
+      }
+      cui_spacer(ui);
+      cui_muted(ui, "Evaluation runs on a worker thread.");
+    }
+
+    if (running) {
+      cui_progress(ui, 0.0f, .indeterminate = true, .tone = CUI_TONE_INFO);
+    }
+    if (state->eval_error[0] != '\0') {
+      (void)cui_alert(ui, "Evaluation error",
+                      .description = state->eval_error, .tone = CUI_TONE_DANGER,
+                      .icon = CUI_ICON_TRIANGLE_ALERT);
+    } else {
+      cui_muted(ui, state->eval_status);
+    }
+  }
+
+  return load_config;
+}
+
+static void studio_eval_metrics(cui_ctx *ui, const studio_state *state)
+{
+  const elml_eval_result *result = &state->eval_result;
+  char rows[32];
+  char skipped[32];
+  snprintf(rows, sizeof rows, "%u", result->row_count);
+  snprintf(skipped, sizeof skipped, "%llu",
+           (unsigned long long)result->skipped);
+
+  if (result->scored && result->classification) {
+    char accuracy[32];
+    char correct[48];
+    const double value =
+        (result->scored_rows == 0u)
+            ? 0.0
+            : (double)result->correct / (double)result->scored_rows;
+    snprintf(accuracy, sizeof accuracy, "%.1f%%", value * 100.0);
+    snprintf(correct, sizeof correct, "%llu / %llu",
+             (unsigned long long)result->correct,
+             (unsigned long long)result->scored_rows);
+    cui_box(ui, .dir = CUI_GRID, .columns = 4, .min_column_width = 160,
+            .gap = 12) {
+      cui_metric(ui, "Accuracy", accuracy, .icon = CUI_ICON_TARGET);
+      cui_metric(ui, "Correct rows", correct, .icon = CUI_ICON_BADGE_CHECK);
+      cui_metric(ui, "Rows checked", rows, .icon = CUI_ICON_LIST);
+      cui_metric(ui, "Skipped", skipped, .icon = CUI_ICON_SKIP_FORWARD);
+    }
+  } else if (result->scored) {
+    char mse[48];
+    char rmse[48];
+    char mae[48];
+    snprintf(mse, sizeof mse, "%.6f", result->mse);
+    snprintf(rmse, sizeof rmse, "%.6f", sqrt(result->mse));
+    snprintf(mae, sizeof mae, "%.6f", result->mae);
+    cui_box(ui, .dir = CUI_GRID, .columns = 4, .min_column_width = 160,
+            .gap = 12) {
+      cui_metric(ui, "MSE", mse, .icon = CUI_ICON_ACTIVITY);
+      cui_metric(ui, "RMSE", rmse, .icon = CUI_ICON_TRENDING_DOWN);
+      cui_metric(ui, "MAE", mae, .icon = CUI_ICON_ACTIVITY);
+      cui_metric(ui, "Rows checked", rows, .icon = CUI_ICON_LIST);
+    }
+  } else {
+    cui_box(ui, .dir = CUI_GRID, .columns = 3, .min_column_width = 160,
+            .gap = 12) {
+      cui_metric(ui, "Rows predicted", rows, .icon = CUI_ICON_LIST);
+      cui_metric(ui, "Scoring", "Off", .icon = CUI_ICON_EYE_OFF);
+      if (result->skipped > 0u) {
+        cui_metric(ui, "Skipped", skipped, .icon = CUI_ICON_SKIP_FORWARD);
+      }
+    }
+  }
+}
+
+static void studio_eval_column_names(const elml_eval_result *result,
+                                     const uint32_t *columns, uint32_t count,
+                                     char *out, size_t cap)
+{
+  if (out == nullptr || cap == 0u) {
+    return;
+  }
+  if (columns == nullptr || count == 0u) {
+    snprintf(out, cap, "%s", "-");
+    return;
+  }
+
+  out[0] = '\0';
+  size_t used = 0u;
+  for (uint32_t i = 0u; i < count; ++i) {
+    char fallback[32];
+    const char *name = nullptr;
+    if (result->has_header) {
+      name = elml_csv_cell(&result->csv, 0u, columns[i]);
+    }
+    if (name == nullptr || name[0] == '\0') {
+      snprintf(fallback, sizeof fallback, "Column %u", columns[i] + 1u);
+      name = fallback;
+    }
+    if (used + 2u >= cap) {
+      break;
+    }
+    const int written = snprintf(out + used, cap - used, "%s%.200s",
+                                 (i == 0u) ? "" : ", ", name);
+    if (written < 0 || (size_t)written >= cap - used) {
+      out[cap - 1u] = '\0';
+      return;
+    }
+    used += (size_t)written;
+  }
+}
+
+static void studio_eval_model_card(cui_ctx *ui, const studio_state *state)
+{
+  const elml_eval_result *result = &state->eval_result;
+
+  cui_card(ui, .width = CUI_FILL, .gap = 10) {
+    cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER) {
+      cui_text(ui, "Model and columns", .font = CUI_FONT_MEDIUM, .size = 15);
+      cui_spacer(ui);
+      if (elml_eval_is_classification(&result->model)) {
+        cui_badge(ui, "Classification", .tone = CUI_TONE_VIOLET, .dot = true);
+      } else {
+        cui_badge(ui, "Regression", .tone = CUI_TONE_TEAL, .dot = true);
+      }
+    }
+
+    studio_detail(ui, "Model", state->eval_model_path);
+    char shape[96];
+    snprintf(shape, sizeof shape, "%u input%s -> %u output%s",
+             result->model.input.dim[0],
+             (result->model.input.dim[0] == 1u) ? "" : "s", result->output_dim,
+             (result->output_dim == 1u) ? "" : "s");
+    studio_detail(ui, "Shape", shape);
+
+    char input_names[ELML_CONFIG_LIST_MAX];
+    char target_names[ELML_CONFIG_LIST_MAX];
+    studio_eval_column_names(result, result->input_columns,
+                             result->input_count, input_names,
+                             sizeof input_names);
+    studio_eval_column_names(result, result->target_columns,
+                             result->target_count, target_names,
+                             sizeof target_names);
+    studio_detail(ui, "Inputs",
+                  (result->input_count > 0u) ? input_names : "-");
+    studio_detail(ui, "Targets",
+                  (result->scored && result->target_count > 0u)
+                      ? target_names
+                      : "not scored");
+    if (result->skipped > 0u && result->skipped_note[0] != '\0') {
+      cui_muted(ui, result->skipped_note);
+    }
+  }
+}
+
+static void studio_eval_table(cui_ctx *ui, studio_state *state)
+{
+  const elml_eval_result *result = &state->eval_result;
+  const bool errors_only =
+      result->classification && result->scored && state->eval_show_errors_only;
+
+  if (result->row_count == 0u) {
+    cui_empty_state(ui, "No rows evaluated", .icon = CUI_ICON_INBOX,
+                    .description = "The CSV has no data rows to check.");
+    return;
+  }
+
+  uint32_t matching = 0u;
+  for (uint32_t r = 0u; r < result->row_count; ++r) {
+    if (!errors_only || !result->rows[r].correct) {
+      matching++;
+    }
+  }
+
+  const uint32_t limit = (state->eval_display_limit == 0u)
+                             ? matching
+                             : state->eval_display_limit;
+  const uint32_t show = (matching > limit) ? limit : matching;
+
+  cui_card(ui, .width = CUI_FILL, .gap = 12) {
+    cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER, .wrap = true) {
+      cui_text(ui, "Per-row results", .font = CUI_FONT_MEDIUM, .size = 15);
+      cui_spacer(ui);
+      if (result->classification && result->scored) {
+        (void)cui_switch(ui, "Incorrect only",
+                         &state->eval_show_errors_only);
+        cui_tooltip(ui, "Hide rows the model classified correctly.");
+      }
+    }
+
+    if (matching == 0u) {
+      cui_empty_state(ui, "Every checked row is correct",
+                      .icon = CUI_ICON_CHECK_CHECK,
+                      .description = "Turn off the filter to see all rows.");
+    } else if (result->classification) {
+      cui_table_column columns[] = {
+          {"Line", CUI_PX(72), CUI_TEXT_RIGHT, false},
+          {"Target", CUI_FILL, CUI_TEXT_LEFT, false},
+          {"Prediction", CUI_FILL, CUI_TEXT_LEFT, false},
+          {"Confidence", CUI_PX(110), CUI_TEXT_RIGHT, false},
+          {"Result", CUI_PX(118), CUI_TEXT_LEFT, false},
+      };
+      uint32_t displayed = 0u;
+      cui_table(ui, "eval_rows", columns, 5, .height = CUI_PX(460),
+                .striped = true, .compact = true) {
+        for (uint32_t r = 0u; r < result->row_count && displayed < show; ++r) {
+          const elml_eval_row *row = &result->rows[r];
+          if (errors_only && row->correct) {
+            continue;
+          }
+          displayed++;
+
+          (void)cui_table_row(ui, false);
+          cui_table_cell_textf(ui, "%u", row->line);
+
+          const char *target = nullptr;
+          if (result->scored && result->target_columns != nullptr) {
+            target = elml_csv_cell(&result->csv, row->line - 1u,
+                                   result->target_columns[0]);
+          }
+          cui_table_cell_text(ui, (target != nullptr) ? target : "-");
+
+          char label[128];
+          cui_table_cell_text(
+              ui, elml_eval_class_label(&result->model, row->predicted, label,
+                                        sizeof label));
+
+          char confidence[32];
+          snprintf(confidence, sizeof confidence, "%.1f%%",
+                   (double)row->confidence * 100.0);
+          cui_table_cell_text(ui, confidence);
+
+          cui_table_cell(ui);
+          if (!result->scored) {
+            cui_text(ui, "-", .color = CUI_COLOR_TEXT_SECONDARY);
+          } else if (row->expected < 0) {
+            cui_badge(ui, "No target", .tone = CUI_TONE_NEUTRAL);
+          } else if (row->correct) {
+            cui_badge(ui, "Correct", .tone = CUI_TONE_SUCCESS, .dot = true);
+          } else {
+            cui_badge(ui, "Wrong", .tone = CUI_TONE_DANGER, .dot = true);
+          }
+        }
+      }
+    } else {
+      cui_table_column columns[] = {
+          {"Line", CUI_PX(72), CUI_TEXT_RIGHT, false},
+          {"Target", CUI_FILL, CUI_TEXT_LEFT, false},
+          {"Prediction", CUI_FILL, CUI_TEXT_LEFT, false},
+          {"Abs error", CUI_PX(150), CUI_TEXT_RIGHT, false},
+      };
+      uint32_t displayed = 0u;
+      cui_table(ui, "eval_rows_regression", columns, 4, .height = CUI_PX(460),
+                .striped = true, .compact = true) {
+        for (uint32_t r = 0u; r < result->row_count && displayed < show; ++r) {
+          const elml_eval_row *row = &result->rows[r];
+          displayed++;
+
+          (void)cui_table_row(ui, false);
+          cui_table_cell_textf(ui, "%u", row->line);
+
+          char target_text[512];
+          char prediction_text[512];
+          char error_text[512];
+          studio_eval_vector_text(elml_eval_targets(result, r),
+                                  result->output_dim, target_text,
+                                  sizeof target_text);
+          studio_eval_vector_text(elml_eval_values(result, r),
+                                  result->output_dim, prediction_text,
+                                  sizeof prediction_text);
+          studio_eval_error_text(result, row, error_text, sizeof error_text);
+
+          cui_table_cell_text(ui, target_text);
+          cui_table_cell_text(ui, prediction_text);
+          cui_table_cell_text(ui, error_text);
+        }
+      }
+    }
+
+    if (matching > show) {
+      char note[160];
+      snprintf(note, sizeof note,
+               "Showing the first %u of %u matching rows; save the predictions "
+               "CSV for the complete list.",
+               show, matching);
+      cui_muted(ui, note);
+    } else if (errors_only) {
+      char note[128];
+      snprintf(note, sizeof note, "%u incorrect row%s shown.", matching,
+               (matching == 1u) ? "" : "s");
+      cui_muted(ui, note);
+    }
+  }
+}
+
+static bool studio_eval_view(cui_ctx *ui, studio_state *state)
+{
+  const bool load_config = studio_eval_controls(ui, state);
+
+  if (state->eval_has_result && state->eval_ok) {
+    studio_eval_metrics(ui, state);
+    studio_eval_model_card(ui, state);
+    studio_eval_table(ui, state);
+    if (state->eval_scroll_results) {
+      state->eval_scroll_results = false;
+      cui_scroll_to(ui, "studio_eval_content", 620.0f);
+    }
+  }
+
+  return load_config;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Main panel                                                                */
+/* ------------------------------------------------------------------------- */
+
+static void studio_training_view(cui_ctx *ui, studio_state *state,
+                               const studio_view *view)
+{
+  cui_scroll(ui, .id = "studio_content", .width = CUI_FILL,
+             .height = CUI_FILL, .pad = 24, .gap = 18, .fade_edges = true) {
+    studio_metrics(ui, view);
+    studio_progress_card(ui, view);
+    studio_chart(ui, "Loss", "Monitored split loss after each epoch",
+                 "loss_chart", studio_draw_loss, view->history_count,
+                 "%.4f", view->history_count > 0,
+                 "The loss curve appears after the first epoch.");
+    studio_chart(ui, "Accuracy",
+                 view->snap.has_accuracy
+                     ? "Share of correctly classified rows"
+                     : "Reported for classification (cross-entropy) runs",
+                 "accuracy_chart", studio_draw_accuracy,
+                 view->history_count, "%.3f",
+                 view->history_count > 0 && view->has_accuracy_history,
+                 view->snap.has_accuracy
+                     ? "The accuracy curve appears after the first epoch."
+                     : "Accuracy is only reported for classification runs.");
+    cui_box(ui, .dir = CUI_GRID, .columns = 2, .min_column_width = 280,
+            .gap = 14) {
+      studio_data_split(ui, view);
+      studio_run_log(ui, view);
+    }
+    studio_run_details(ui, state, view);
+  }
+}
+
+static void studio_main(cui_ctx *ui, studio_state *state,
+                        const studio_view *view)
+{
+  static const char *tabs[] = {"Training", "Evaluate"};
+  static const char *tab_icons[] = {CUI_ICON_ACTIVITY, CUI_ICON_TARGET};
+  const bool evaluating = studio_eval_running(state);
+  bool load_config = false;
+
+  cui_column(ui, .width = CUI_FILL, .height = CUI_FILL,
+             .bg = CUI_COLOR_BACKGROUND) {
+    cui_row(ui, .width = CUI_FILL, .pad_x = 24, .pad_y = 14, .gap = 12,
+            .align = CUI_ALIGN_CENTER) {
+      cui_column(ui, .gap = 2) {
+        cui_heading(ui, (state->tab == 0) ? "Training run"
+                                         : "Evaluate a saved model",
+                    2);
+        cui_secondary(ui,
+                      (state->tab == 0)
+                          ? "Adjust parameters on the left; the charts follow "
+                            "each epoch."
+                          : "Load a CSV and a model, then check every row.");
+      }
+      cui_spacer(ui);
+      if (state->tab == 0) {
+        if (view->running) {
+          cui_badge(ui, "Training", .tone = CUI_TONE_INFO, .dot = true);
+        } else if (view->snap.error[0] != '\0') {
+          cui_badge(ui, "Needs attention", .tone = CUI_TONE_DANGER, .dot = true);
+        } else if (view->snap.stopped) {
+          cui_badge(ui, "Stopped", .tone = CUI_TONE_WARNING, .dot = true);
+        } else if (view->snap.early_stopped) {
+          cui_badge(ui, "Early stop", .tone = CUI_TONE_WARNING, .dot = true);
+        } else if (view->snap.exported) {
+          cui_badge(ui, "Complete", .tone = CUI_TONE_SUCCESS, .dot = true);
+        } else {
+          cui_badge(ui, "Idle", .tone = CUI_TONE_NEUTRAL, .dot = true);
+        }
+      } else {
+        if (evaluating) {
+          cui_badge(ui, "Evaluating", .tone = CUI_TONE_INFO, .dot = true);
+        } else if (state->eval_error[0] != '\0') {
+          cui_badge(ui, "Needs attention", .tone = CUI_TONE_DANGER, .dot = true);
+        } else if (state->eval_has_result) {
+          cui_badge(ui, "Complete", .tone = CUI_TONE_SUCCESS, .dot = true);
+        } else {
+          cui_badge(ui, "Idle", .tone = CUI_TONE_NEUTRAL, .dot = true);
+        }
       }
       if (cui_icon_button(ui,
                           state->theme == CUI_THEME_DARK ? CUI_ICON_SUN
@@ -1897,34 +3191,41 @@ static void studio_main(cui_ctx *ui, studio_state *state,
         cui_set_theme(ui, state->theme);
       }
     }
+
+    cui_row(ui, .width = CUI_FILL, .pad_x = 24, .gap = 4) {
+      cui_tabs(ui, "studio_tabs", tabs, 2, &state->tab, .icons = tab_icons);
+    }
     cui_separator(ui);
 
-    cui_scroll(ui, .id = "studio_content", .width = CUI_FILL,
-               .height = CUI_FILL, .pad = 24, .gap = 18, .fade_edges = true) {
-      studio_metrics(ui, view);
-      studio_progress_card(ui, view);
-      studio_chart(ui, "Loss", "Monitored split loss after each epoch",
-                   "loss_chart", studio_draw_loss, view->history_count,
-                   "%.4f", view->history_count > 0,
-                   "The loss curve appears after the first epoch.");
-      studio_chart(ui, "Accuracy",
-                   view->snap.has_accuracy
-                       ? "Share of correctly classified rows"
-                       : "Reported for classification (cross-entropy) runs",
-                   "accuracy_chart", studio_draw_accuracy,
-                   view->history_count, "%.3f",
-                   view->history_count > 0 && view->has_accuracy_history,
-                   view->snap.has_accuracy
-                       ? "The accuracy curve appears after the first epoch."
-                       : "Accuracy is only reported for classification runs.");
-      studio_run_details(ui, state, view);
+    if (state->tab == 0) {
+      studio_training_view(ui, state, view);
+    } else {
+      cui_scroll(ui, .id = "studio_eval_content", .width = CUI_FILL,
+                 .height = CUI_FILL, .pad = 24, .gap = 18) {
+        load_config = studio_eval_view(ui, state);
+      }
     }
+  }
+
+  if (load_config) {
+    studio_load_config(state, false);
+    studio_lock(state);
+    if (state->snap.error[0] != '\0') {
+      snprintf(state->eval_error, sizeof state->eval_error, "%.1000s",
+               state->snap.error);
+      snprintf(state->eval_status, sizeof state->eval_status, "%s",
+               "The configuration could not be loaded.");
+    }
+    studio_unlock(state);
+    cui_request_redraw(ui);
   }
 }
 
 static void studio_frame(cui_ctx *ui, studio_state *state)
 {
+  studio_eval_collect(state);
   studio_columns_sync(state);
+  studio_eval_columns_sync(state);
 
   studio_view view;
   studio_take_view(state, &view);
@@ -1934,9 +3235,11 @@ static void studio_frame(cui_ctx *ui, studio_state *state)
 
   cui_row(ui, .width = CUI_FILL, .height = CUI_FILL, .gap = 0,
           .align = CUI_ALIGN_STRETCH, .bg = CUI_COLOR_BACKGROUND) {
-    load_clicked = studio_sidebar(ui, state, view.running);
-    if (!narrow) {
-      cui_separator(ui);
+    if (state->tab == 0) {
+      load_clicked = studio_sidebar(ui, state, view.running);
+      if (!narrow) {
+        cui_separator(ui);
+      }
     }
     studio_main(ui, state, &view);
   }
@@ -1944,25 +3247,39 @@ static void studio_frame(cui_ctx *ui, studio_state *state)
   if (load_clicked) {
     studio_load_config(state, false);
   }
+
+  /* Idle windows sleep inside CUI. While a run is active, ask for the next
+   * frame explicitly so the worker's epoch snapshots reach the charts. */
+  if (view.running || studio_eval_running(state)) {
+    cui_request_redraw(ui);
+  }
 }
 
 static bool studio_parse_args(studio_state *state, int argc, char **argv,
-                              bool *autostart)
+                              bool *autostart, bool *autoeval)
 {
   bool explicit_config = false;
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--autostart") == 0) {
       *autostart = true;
+    } else if (strcmp(argv[i], "--autoeval") == 0) {
+      *autoeval = true;
+    } else if (strcmp(argv[i], "--evaluate") == 0) {
+      state->tab = 1;
     } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
       studio_copy_string(state->config_path, sizeof state->config_path,
                          argv[i + 1]);
       explicit_config = true;
       ++i;
     } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-      printf("usage: elml_studio [--config FILE] [--autostart]\n"
+      printf("usage: elml_studio [--config FILE] [--evaluate] [--autostart] "
+             "[--autoeval]\n"
              "\n"
              "  --config FILE   load an .ini training configuration\n"
+             "  --evaluate      open the Evaluate tab\n"
              "  --autostart     start training as soon as the window opens\n"
+             "  --autoeval      evaluate the configured CSV and model on\n"
+             "                  startup (implies --evaluate)\n"
              "\n"
              "The CUI_SCREENSHOT and CUI_SCREENSHOT_FRAMES environment\n"
              "variables save a frame to PNG and quit (handy for demos).\n");
@@ -1972,6 +3289,9 @@ static bool studio_parse_args(studio_state *state, int argc, char **argv,
                          argv[i]);
       explicit_config = true;
     }
+  }
+  if (*autoeval) {
+    state->tab = 1;
   }
   if (state->config_path[0] != '\0') {
     studio_load_config(state, !explicit_config);
@@ -1986,7 +3306,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "elml_studio: out of memory\n");
     return 1;
   }
-  if (mtx_init(&state->mutex, mtx_plain) != thrd_success) {
+  if (pthread_mutex_init(&state->mutex, nullptr) != 0) {
     fprintf(stderr, "elml_studio: cannot create the UI mutex\n");
     free(state);
     return 1;
@@ -1994,8 +3314,9 @@ int main(int argc, char **argv)
 
   studio_defaults(state);
   bool autostart = false;
-  if (!studio_parse_args(state, argc, argv, &autostart)) {
-    mtx_destroy(&state->mutex);
+  bool autoeval = false;
+  if (!studio_parse_args(state, argc, argv, &autostart, &autoeval)) {
+    pthread_mutex_destroy(&state->mutex);
     free(state);
     return 0;
   }
@@ -2006,30 +3327,43 @@ int main(int argc, char **argv)
       .height = 880,
       .min_width = 860,
       .min_height = 600,
-      .continuous = true,
+      .continuous = false,
       .theme = CUI_THEME_DARK,
       .accent = CUI_ACCENT_VIOLET});
   if (app == nullptr) {
     fprintf(stderr, "elml_studio: cannot create a window\n");
-    mtx_destroy(&state->mutex);
+    pthread_mutex_destroy(&state->mutex);
     free(state);
     return 1;
   }
   state->app = app;
 
   bool start_requested = autostart;
+  bool eval_requested = autoeval;
+  const bool screenshot_mode = getenv("CUI_SCREENSHOT") != nullptr;
+  double active_until = 0.0;
   while (cui_app_frame(app)) {
     studio_frame(cui_app_ui(app), state);
     if (start_requested) {
       start_requested = false;
       studio_start(state);
     }
+    if (eval_requested) {
+      eval_requested = false;
+      studio_eval_start(state);
+    }
+    if (!screenshot_mode) {
+      studio_pace(cui_app_ui(app),
+                  studio_is_running(state) || studio_eval_running(state),
+                  &active_until);
+    }
   }
 
   studio_shutdown(state);
   cui_app_destroy(app);
   studio_columns_release(&state->columns);
-  mtx_destroy(&state->mutex);
+  studio_columns_release(&state->eval_columns);
+  pthread_mutex_destroy(&state->mutex);
   free(state);
   return 0;
 }

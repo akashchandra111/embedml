@@ -28,12 +28,15 @@ Defines the project, options, warning set, and targets.
   `ELML_SIMD` and `CMAKE_SYSTEM_PROCESSOR`.
 * `elml_train_lib` (static library, host only): writer plus trainer support.
   Sources are `write.c`, `csv.c`, `ini.c`, `io.c`, `config.c`, `dataset.c`,
-  `net.c`, `session.c`, `export.c`.
+  `net.c`, `evaluate.c`, `session.c`, `export.c`.
 * `elml_inspect`: parses and prints a model without running it.
 * `elml_train`: the training executable.
 * `elml_run`: the inference/evaluation executable.
 * `elml_studio` (optional, `ELML_BUILD_STUDIO=ON`): CUI desktop frontend that
   links `elml_train_lib`, `Threads::Threads`, and `cui::cui`.
+* CUI is vendored as the `third_party/CUI` git submodule. `ELML_CUI_SOURCE_DIR`
+  overrides it with another checkout, and configure fails with an
+  initialization hint when the submodule is missing.
 * `ELML_MAX_LAYERS` and `ELML_MAX_RANK` are public compile definitions so the
   public structs and the parser agree.
 * Tests and the iris example are only registered when `ELML_TRAIN` is on.
@@ -662,6 +665,37 @@ Reusable host-only training session shared by the CLI and the studio.
   order: training order, network, normalization, validation set, then training
   set. Safe on partially initialized sessions.
 
+### `evaluate.h` / `evaluate.c`
+
+Host-only evaluator shared by `elml_run --csv` and the studio's Evaluate tab.
+It owns the loaded model, parsed CSV, resolved columns, and per-row results.
+
+* `elml_eval_options`: model and CSV paths, delimiter/header flags, optional
+  input and target column lists (names or 1-based indices), a `score` switch,
+  `skip_bad_rows`, and a row limit.
+* `elml_eval_result`: owns the model blob, CSV, input/target column indices,
+  contiguous prediction and target blocks, per-row records (line, predicted
+  class, expected class, confidence, correct), and the summary (scored rows,
+  correct count, MSE, MAE, skipped count, explanatory text).
+* `elml_eval_run(options, result)`: reads the model with `ELML_PARAM_ALIGN`,
+  binds it, loads the CSV, resolves inputs from the option, then
+  `columns.inputs`, then the first N columns. When `score` is set it resolves
+  targets from the option, then `columns.outputs`, and compares each row:
+  classification matches the CSV target against the model labels; regression
+  parses every target and accumulates squared/absolute error. `skip_bad_rows`
+  skips malformed cells for the GUI, while the CLI leaves it off to fail fast.
+  On failure the result still owns any partial allocation and its `message`
+  explains the problem.
+* `elml_eval_free(result)`: releases in reverse allocation order: rows,
+  targets, values, target columns, input columns, CSV, blob.
+* `elml_eval_write_csv(result, path)`: writes the original columns plus
+  `prediction` and `prob_<label>` for classification, or `pred_N` for
+  regression, quoting fields as needed.
+* `elml_eval_is_classification`, `elml_eval_class_label`,
+  `elml_eval_output_name`, `elml_eval_values`, `elml_eval_targets`: metadata
+  and row accessors shared with the CLI's single-row output and the studio
+  table.
+
 ### `train_main.c`
 
 Command-line training executable.
@@ -688,40 +722,77 @@ The studio is optional, host-only, and built only when
 
 ### `studio_main.c`
 
-CUI desktop frontend with a parameter sidebar and a live results panel.
+CUI desktop frontend with a parameter sidebar, a Training tab, and an Evaluate
+tab for checking a saved model against a CSV.
 
 * `studio_snapshot` / `studio_view`: shared run state copied from the worker
   under a mutex once per frame; the view owns the chart arrays handed to CUI.
 * `studio_state`: UI parameters, training session pointer, worker thread,
-  mutex, chart history, column-picker state, and theme.
-* `studio_lock` / `studio_unlock` / `studio_is_running`: protect the snapshot
-  and stop state shared with the training thread.
+  mutex, chart history, column-picker state for both tabs, theme, the active
+  tab, and the Evaluate tab's paths, result, and evaluation thread.
+* `studio_lock` / `studio_unlock` / `studio_is_running` /
+  `studio_eval_running`: protect the snapshot, stop state, and evaluation
+  hand-off shared with the worker threads.
 * `studio_defaults`: sets initial parameter values and loads
   `examples/iris/iris.ini` when available.
 * `studio_apply_config` / `studio_load_config`: reuse `elml_config_load` and
   copy the parsed configuration into the editable fields. Relative paths are
-  resolved next to the `.ini` file.
+  resolved next to the `.ini` file. The same pass seeds the Evaluate tab with
+  the export path, CSV, columns, header, and delimiter, and clears stale
+  evaluation results.
 * `studio_columns_*`: read the CSV header with `elml_csv_read_header`, build
   display labels and 1-based index values, apply the configured inputs/outputs,
   and keep the two multi-selects exclusive. Selecting a column on one side
-  clears it on the other. `studio_columns_validate` ensures the header is
+  clears it on the other. `studio_columns_config` binds an independent picker
+  to one CSV and its two text lists, so Training and Evaluate each own a
+  `studio_columns` instance; `studio_columns_validate` ensures the header is
   loaded and rejects empty, overlapping, or numerically ambiguous selections
-  before training starts.
-* `studio_column_picker`: renders two searchable `cui_multi_select` controls
-  when columns are available, or fallback text fields while the CSV cannot be
-  read.
+  before a run starts.
+* `studio_column_picker_ex`: renders two searchable `cui_multi_select` controls
+  for any column source, or fallback text fields while the CSV cannot be read
+  (Training only). The Evaluate tab always uses the picker.
 * `studio_build_config`: synthesizes the equivalent CLI argv and calls
   `elml_config_load`, so validation and finalization are identical to the CLI.
 * `studio_progress`: mutex-protected epoch callback; appends loss/accuracy
   history for the charts.
 * `studio_worker`: owns the `elml_training` session, runs the loop, exports the
-  best weights, and publishes final status/error text.
+  best weights, and publishes final status/error text. A successful export
+  flags the Evaluate tab to reuse the new model path.
 * `studio_start` / `studio_stop` / `studio_shutdown`: create/join the worker
-  thread and request a stop through `elml_training_request_stop`.
-* `studio_sidebar` / `studio_main` / `studio_frame`: draw the parameter panel,
-  KPI cards, progress bar, charts, run details, export status, and error alerts.
-* `main`: parses `--config FILE`, `--autostart`, and `--help`, creates the CUI
-  app, runs frames, and releases the column state and worker on exit.
+  thread with `pthread_create` / `pthread_join` and request a stop through
+  `elml_training_request_stop`. Shutdown also joins the evaluation worker and
+  frees both result holders. Threads and mutexes are POSIX so the studio builds
+  on macOS as well as Linux.
+* `studio_eval_start` / `studio_eval_worker` / `studio_eval_collect`: run
+  `elml_eval_run` on a second pthread. The worker moves its result into a
+  mutex-protected staging record; the UI thread moves that record into
+  `eval_result` at the start of the next frame, so CUI never sees a
+  half-written struct. Evaluation skips malformed rows instead of aborting.
+* `studio_eval_controls` / `studio_eval_metrics` / `studio_eval_model_card` /
+  `studio_eval_table`: draw the model and CSV pickers, `.ini` loader, header,
+  delimiter and scoring switches, the same CSV-header multi-select pickers the
+  Training tab uses (empty means "use the model metadata"), accuracy or
+  MSE/RMSE/MAE cards, model details with resolved column names, and the per-row
+  table with the **Incorrect only** filter. The table caps the display at
+  `eval_display_limit` rows and points at the saved CSV for the rest.
+* `studio_eval_save`: writes the current result through
+  `elml_eval_write_csv` after a save dialog.
+* `studio_pace`: the main loop sleeps from the app side. CUI's X11 wait can
+  return immediately whenever the display connection is readable, so an
+  un-paced event loop redraws at the refresh rate while the window is idle and
+  burns a core. The studio runs at full speed while something animates (hover,
+  tooltips, chart tweens, plus a short hold afterwards), sleeps 30 ms per
+  iteration during a run so epochs arrive at a readable pace, and sleeps 33 ms
+  when the window has nothing to show. `CUI_SCREENSHOT` mode skips pacing.
+* `studio_sidebar` / `studio_training_view` / `studio_main` / `studio_frame`:
+  draw the parameter panel, the Training and Evaluate tabs, KPI cards, progress
+  bar, charts, run details, evaluation summary and table, export status, and
+  error alerts. The sidebar is shown on the Training tab; Evaluate uses the full
+  width. A completed evaluation scrolls the view to its results.
+* `main`: parses `--config FILE`, `--evaluate`, `--autostart`, `--autoeval`,
+  and `--help`, creates the CUI app, runs frames, and releases the column
+  state and both workers on exit. `--autoeval` opens the Evaluate tab and runs
+  the configured CSV/model on startup.
 
 The worker never calls CUI. Only the UI thread touches widgets and column
 state; the training thread only updates the mutex-protected snapshot and its
@@ -733,8 +804,9 @@ atomic stop flag.
 
 ### `run_main.c`
 
-Standalone inference/evaluation tool. It links both the core and the host
-libraries (for CSV and column resolution).
+Standalone inference/evaluation tool. It links the core and host libraries.
+CSV evaluation now goes through the shared `evaluate` module, while one-shot
+prediction and the REPL keep a single loaded model.
 
 * `elml_run_options`: model/CSV/output paths, prediction text, column lists,
   header/delimiter flags, evaluate/quiet/json/stdin/repl/prompt flags, row
@@ -743,22 +815,9 @@ libraries (for CSV and column resolution).
 * `elml_parse_delimiter(text, out)`: accepts a single character or `\t`.
 * `elml_parse_limit(text, out)`: parses a `uint32_t` row limit.
 * `elml_parse_top(text, out)`: parses a positive `--top` class count.
-* `elml_parse_cell(text, out)`: strict finite f32 parse.
 * `elml_run_parse(options, argc, argv)`: parses arguments, resolves
   `--predict -` to stdin, and rejects conflicting modes. Returns
   `ELML_ERR_NOT_FOUND` for `--help`.
-* `elml_meta_string(model, key, buffer, capacity, found)`: reads a metadata
-  string, treating an absent key as "not found" rather than an error.
-* `elml_write_field(file, text, delimiter)`: writes a CSV field, quoting when
-  it contains the delimiter, quotes, CR, or LF.
-* `elml_target_label(model, index, buffer, capacity)`: returns a model label or
-  a generated `class_N` fallback.
-* `elml_model_is_classification(model)`: reads the `task` metadata, falling
-  back to "labels exist ⇒ classification" for older models.
-* `elml_meta_token(list, index, out, capacity)`: copies the index-th
-  comma-separated token of a metadata list, trimming spaces.
-* `elml_output_name(model, index, buffer, capacity)`: returns the index-th
-  `columns.outputs` name or a generated `output_N` fallback.
 * `elml_json_write_string(file, text)`: writes a JSON-escaped string.
 * `elml_parse_feature_row(text, values, dim)`: parses exactly `dim`
   comma-separated finite floats, rejecting missing, extra, or malformed values.
@@ -776,21 +835,15 @@ libraries (for CSV and column resolution).
 * `elml_run_repl(model, options)`: loads nothing after startup; loops over
   stdin lines with the same buffers, ignores blank lines, continues after a
   malformed row, accepts `quit`/`exit`, and flushes stdout after every answer.
-* `main`:
-  1. parses options and loads the model with 64-byte alignment;
-  2. rejects unsupported dtypes and a metadata label count that does not match
-     the output dimension;
-  3. takes the one-shot `--predict`/`--stdin` or looping `--repl` path when
-     requested;
-  4. loads the CSV and resolves input columns, preferring `--inputs`, then
-     `columns.inputs`, then the first N columns;
-  5. requires output columns for `--evaluate`, preferring `--outputs`, then
-     `columns.outputs`, and validates the regression output count;
-  6. allocates aligned scratch and per-sample buffers;
-  7. optionally writes an augmented prediction CSV (original columns plus
-     `prediction` and per-class probabilities, or `pred_N`);
-  8. runs `elml_forward` per row, optionally computes accuracy or
-     MSE/RMSE/MAE, and prints a summary unless `--quiet`.
+* `elml_run_load_model(path, blob, model)`: reads a model with
+  `ELML_PARAM_ALIGN`, binds it, and rejects a metadata label count that does
+  not match the output dimension. Shared by the predict and REPL paths.
+* `main`: parses the arguments. In CSV mode it forwards the paths, column
+  overrides, header/delimiter flags, score switch, and row limit to
+  `elml_eval_run`, optionally writes the augmented file with
+  `elml_eval_write_csv`, and prints the row count plus accuracy or
+  MSE/RMSE/MAE. With `--predict`, `--stdin`, or `--repl` it loads the model
+  through `elml_run_load_model` and takes the single-row path.
 
 ---
 
@@ -1073,6 +1126,25 @@ elml_forward
   denormalize into output
 ```
 
+### CSV evaluation
+
+```
+elml_eval_run
+  read model with ELML_PARAM_ALIGN + elml_model_init
+  elml_csv_load
+  eval_resolve_inputs: option -> columns.inputs -> first N columns
+  eval_resolve_targets: option -> columns.outputs (score only)
+  eval_rows
+    per row: parse inputs, elml_forward
+    classification: top class, label match, confidence
+    regression: parse targets, accumulate squared/absolute error
+elml_eval_write_csv
+elml_eval_free (reverse allocation order)
+```
+
+`elml_run --csv` and the studio Evaluate tab both call this module, so column
+resolution, per-row results, and the saved prediction format stay identical.
+
 ### Inspection
 
 ```
@@ -1094,6 +1166,7 @@ elml_inspect (inspect_main.c)
 | New layer type | `registry.h`, new `src/core/layers/*.c`, `registry.c`, `layer_vt.h`, writer/parser descriptors, format docs |
 | New CSV option | `config.h/.c`, `session.c`, `train_main.c`, `dataset.c`, tests |
 | New studio control | `src/studio/studio_main.c`, `studio_build_config`, `README.md` |
+| Change evaluation | `evaluate.c`, `run_main.c`, `studio_main.c`, `tests/test_cli.sh` |
 | Change column picker | `csv.c` (`elml_csv_read_header`), `studio_main.c` (`studio_columns_*`), `test_csv.c` |
 | New metadata key | `export.c`, `model.c` accessors if needed, `run_main.c`, format docs |
 | Format change | `format.h`, `read.c`, `write.c`, `docs/FORMAT.md`, `test_format.c` |

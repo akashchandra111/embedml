@@ -9,8 +9,7 @@
 #include "elml/arena.h"
 #include "elml/model.h"
 #include "elml/types.h"
-#include "train/csv.h"
-#include "train/dataset.h"
+#include "train/evaluate.h"
 #include "train/io.h"
 
 typedef struct elml_run_options {
@@ -96,20 +95,6 @@ static elml_status elml_parse_top(const char *text, uint32_t *out)
     return ELML_ERR_INVALID_ARG;
   }
   *out = (uint32_t)value;
-  return ELML_OK;
-}
-
-static elml_status elml_parse_cell(const char *text, float *out)
-{
-  if (text == nullptr || out == nullptr || *text == '\0') {
-    return ELML_ERR_INVALID_ARG;
-  }
-  char *end = nullptr;
-  const float value = strtof(text, &end);
-  if (end == text || *end != '\0' || !isfinite(value)) {
-    return ELML_ERR_INVALID_ARG;
-  }
-  *out = value;
   return ELML_OK;
 }
 
@@ -256,120 +241,6 @@ static elml_status elml_run_parse(elml_run_options *options, int argc,
     }
   }
   return ELML_OK;
-}
-
-static elml_status elml_meta_string(const elml_model *model, const char *key,
-                                    char *buffer, size_t capacity,
-                                    bool *found)
-{
-  *found = false;
-  size_t len = 0u;
-  const elml_status status =
-      elml_meta_get(model, key, buffer, capacity, &len);
-  if (status == ELML_OK) {
-    *found = true;
-    return ELML_OK;
-  }
-  if (status == ELML_ERR_NOT_FOUND) {
-    return ELML_OK;
-  }
-  return status;
-}
-
-static void elml_write_field(FILE *file, const char *text, char delimiter)
-{
-  bool needs_quotes = false;
-  for (const char *cursor = text; *cursor != '\0'; ++cursor) {
-    if (*cursor == delimiter || *cursor == '"' || *cursor == '\n' ||
-        *cursor == '\r') {
-      needs_quotes = true;
-      break;
-    }
-  }
-  if (!needs_quotes) {
-    fputs(text, file);
-    return;
-  }
-  fputc('"', file);
-  for (const char *cursor = text; *cursor != '\0'; ++cursor) {
-    if (*cursor == '"') {
-      fputc('"', file);
-    }
-    fputc(*cursor, file);
-  }
-  fputc('"', file);
-}
-
-static const char *elml_target_label(const elml_model *model, uint32_t index,
-                                     char *buffer, size_t capacity)
-{
-  size_t len = 0u;
-  if (elml_label_get(model, index, buffer, capacity, &len) == ELML_OK) {
-    return buffer;
-  }
-  snprintf(buffer, capacity, "class_%u", index);
-  return buffer;
-}
-
-static bool elml_model_is_classification(const elml_model *model)
-{
-  char task[32];
-  size_t len = 0u;
-  if (elml_meta_get(model, "task", task, sizeof task, &len) == ELML_OK) {
-    return strcmp(task, "classification") == 0;
-  }
-  return elml_label_count(model) > 0u;
-}
-
-static bool elml_meta_token(const char *list, uint32_t index, char *out,
-                            size_t capacity)
-{
-  if (list == nullptr || out == nullptr || capacity == 0u) {
-    return false;
-  }
-
-  uint32_t current = 0u;
-  const char *start = list;
-  for (;;) {
-    const char *end = strchr(start, ',');
-    if (end == nullptr) {
-      end = start + strlen(start);
-    }
-    if (current == index) {
-      while (start < end && (*start == ' ' || *start == '\t')) {
-        start++;
-      }
-      while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
-        end--;
-      }
-      const size_t len = (size_t)(end - start);
-      if (len + 1u > capacity) {
-        return false;
-      }
-      memcpy(out, start, len);
-      out[len] = '\0';
-      return true;
-    }
-    if (*end == '\0') {
-      return false;
-    }
-    start = end + 1;
-    current++;
-  }
-}
-
-static const char *elml_output_name(const elml_model *model, uint32_t index,
-                                    char *buffer, size_t capacity)
-{
-  char list[ELML_CONFIG_LIST_MAX];
-  size_t len = 0u;
-  if (elml_meta_get(model, "columns.outputs", list, sizeof list, &len) ==
-          ELML_OK &&
-      elml_meta_token(list, index, buffer, capacity)) {
-    return buffer;
-  }
-  snprintf(buffer, capacity, "output_%u", index);
-  return buffer;
 }
 
 static void elml_json_write_string(FILE *file, const char *text)
@@ -569,7 +440,7 @@ static void elml_print_prediction(const elml_model *model,
                                   const float *prediction, uint32_t *order)
 {
   const uint32_t output_dim = model->output.dim[0];
-  const bool classification = elml_model_is_classification(model);
+  const bool classification = elml_eval_is_classification(model);
   if (!classification) {
     if (options->json) {
       printf("{\"task\":\"regression\",\"outputs\":[");
@@ -579,8 +450,8 @@ static void elml_print_prediction(const elml_model *model,
           fputc(',', stdout);
         }
         printf("{\"name\":");
-        elml_json_write_string(stdout,
-                               elml_output_name(model, o, name, sizeof name));
+        elml_json_write_string(
+            stdout, elml_eval_output_name(model, o, name, sizeof name));
         printf(",\"value\":%.6g}", (double)prediction[o]);
       }
       printf("]}\n");
@@ -588,7 +459,7 @@ static void elml_print_prediction(const elml_model *model,
       for (uint32_t o = 0u; o < output_dim; ++o) {
         char name[128];
         printf("%s = %.6g\n",
-               elml_output_name(model, o, name, sizeof name),
+               elml_eval_output_name(model, o, name, sizeof name),
                (double)prediction[o]);
       }
     }
@@ -621,7 +492,7 @@ static void elml_print_prediction(const elml_model *model,
     char label[128];
     printf("{\"task\":\"classification\",\"prediction\":");
     elml_json_write_string(
-        stdout, elml_target_label(model, order[0], label, sizeof label));
+        stdout, elml_eval_class_label(model, order[0], label, sizeof label));
     printf(",\"index\":%u,\"probability\":%.6f,\"top\":[", order[0],
            (double)prediction[order[0]]);
     for (uint32_t i = 0u; i < top_k; ++i) {
@@ -630,7 +501,7 @@ static void elml_print_prediction(const elml_model *model,
       }
       printf("{\"label\":");
       elml_json_write_string(
-          stdout, elml_target_label(model, order[i], label, sizeof label));
+          stdout, elml_eval_class_label(model, order[i], label, sizeof label));
       printf(",\"index\":%u,\"probability\":%.6f}", order[i],
              (double)prediction[order[i]]);
     }
@@ -639,7 +510,7 @@ static void elml_print_prediction(const elml_model *model,
     for (uint32_t i = 0u; i < top_k; ++i) {
       char label[128];
       const char *name =
-          elml_target_label(model, order[i], label, sizeof label);
+          elml_eval_class_label(model, order[i], label, sizeof label);
       if (top_k == 1u) {
         printf("%s %.6f\n", name, (double)prediction[order[i]]);
       } else {
@@ -652,7 +523,7 @@ static void elml_print_prediction(const elml_model *model,
 static int elml_run_predict(const elml_model *model,
                             const elml_run_options *options)
 {
-  const bool classification = elml_model_is_classification(model);
+  const bool classification = elml_eval_is_classification(model);
 
   char *stdin_row = nullptr;
   const char *row = options->predict_text;
@@ -707,7 +578,7 @@ static int elml_run_predict(const elml_model *model,
 static int elml_run_repl(const elml_model *model,
                          const elml_run_options *options)
 {
-  const bool classification = elml_model_is_classification(model);
+  const bool classification = elml_eval_is_classification(model);
   elml_predict_buffers buffers;
   elml_status status =
       elml_predict_buffers_alloc(model, classification, &buffers);
@@ -780,6 +651,39 @@ static int elml_run_repl(const elml_model *model,
   return exit_code;
 }
 
+static int elml_run_load_model(const char *path, uint8_t **blob,
+                               elml_model *model)
+{
+  size_t blob_len = 0u;
+  elml_status status = elml_read_file(path, blob, &blob_len, ELML_PARAM_ALIGN);
+  if (status != ELML_OK) {
+    fprintf(stderr, "elml_run: cannot read %s: %s\n", path,
+            elml_error_string(status));
+    return 1;
+  }
+
+  status = elml_model_init(model, *blob, blob_len, ELML_DTYPE_F32);
+  if (status != ELML_OK) {
+    fprintf(stderr, "elml_run: cannot load model: %s\n",
+            elml_error_string(status));
+    free(*blob);
+    *blob = nullptr;
+    return 1;
+  }
+
+  const uint32_t output_dim = model->output.dim[0];
+  const uint32_t label_count = elml_label_count(model);
+  if (label_count > 0u && label_count != output_dim) {
+    fprintf(stderr,
+            "elml_run: model metadata lists %u labels for %u outputs\n",
+            label_count, output_dim);
+    free(*blob);
+    *blob = nullptr;
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   elml_run_options options;
@@ -794,402 +698,72 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  uint8_t *blob = nullptr;
-  size_t blob_len = 0u;
-  status = elml_read_file(options.model_path, &blob, &blob_len,
-                          ELML_PARAM_ALIGN);
-  if (status != ELML_OK) {
-    fprintf(stderr, "elml_run: cannot read %s: %s\n", options.model_path,
-            elml_error_string(status));
-    return 1;
-  }
-
-  elml_model model;
-  status = elml_model_init(&model, blob, blob_len, ELML_DTYPE_F32);
-  if (status != ELML_OK) {
-    fprintf(stderr, "elml_run: cannot load model: %s\n",
-            elml_error_string(status));
-    free(blob);
-    return 1;
-  }
-
-  const uint32_t input_dim = model.input.dim[0];
-  const uint32_t output_dim = model.output.dim[0];
-  const uint32_t label_count = elml_label_count(&model);
-  if (label_count > 0u && label_count != output_dim) {
-    fprintf(stderr,
-            "elml_run: model metadata lists %u labels for %u outputs\n",
-            label_count, output_dim);
-    free(blob);
-    return 1;
-  }
-
-  if (options.repl) {
-    const int result = elml_run_repl(&model, &options);
-    free(blob);
-    return result;
-  }
-
-  if (options.predict_text != nullptr || options.use_stdin) {
-    const int result = elml_run_predict(&model, &options);
-    free(blob);
-    return result;
-  }
-
-  elml_csv csv;
-  status = elml_csv_load(options.csv_path, options.delimiter,
-                         options.has_header, &csv);
-  if (status != ELML_OK) {
-    fprintf(stderr, "elml_run: cannot read %s: %s\n", options.csv_path,
-            elml_error_string(status));
-    free(blob);
-    return 1;
-  }
-
-  char metadata[ELML_CONFIG_LIST_MAX];
-  bool have_meta = false;
-
-  if (!options.has_inputs) {
-    status = elml_meta_string(&model, "columns.inputs", metadata,
-                              sizeof metadata, &have_meta);
-    if (status == ELML_OK && have_meta) {
-      const size_t len = strlen(metadata);
-      if (len + 1u > sizeof options.inputs) {
-        status = ELML_ERR_BUFFER_TOO_SMALL;
-      } else {
-        memcpy(options.inputs, metadata, len + 1u);
-        options.has_inputs = true;
-      }
-    }
-  }
-  if (!options.has_outputs) {
-    status = elml_meta_string(&model, "columns.outputs", metadata,
-                              sizeof metadata, &have_meta);
-    if (status == ELML_OK && have_meta) {
-      const size_t len = strlen(metadata);
-      if (len + 1u > sizeof options.outputs) {
-        status = ELML_ERR_BUFFER_TOO_SMALL;
-      } else {
-        memcpy(options.outputs, metadata, len + 1u);
-        options.has_outputs = true;
-      }
-    }
-  }
-
-  uint32_t *input_columns = nullptr;
-  uint32_t input_count = 0u;
-  if (options.has_inputs) {
-    status = elml_columns_resolve(options.inputs, &csv, &input_columns,
-                                  &input_count);
-  } else {
-    input_columns =
-        (uint32_t *)malloc((size_t)input_dim * sizeof(uint32_t));
-    if (input_columns == nullptr) {
-      status = ELML_ERR_OUT_OF_MEMORY;
-    } else {
-      input_count = input_dim;
-      for (uint32_t i = 0u; i < input_dim; ++i) {
-        input_columns[i] = i;
-      }
-    }
-  }
-  if (status == ELML_OK && input_count != input_dim) {
-    fprintf(stderr, "elml_run: model expects %u inputs, %u columns given\n",
-            input_dim, input_count);
-    status = ELML_ERR_INVALID_ARG;
-  }
-  if (status == ELML_OK && csv.cols < input_dim) {
-    status = ELML_ERR_INVALID_ARG;
-  }
-  if (status != ELML_OK) {
-    fprintf(stderr, "elml_run: cannot resolve input columns: %s\n",
-            elml_error_string(status));
-    free(input_columns);
-    elml_csv_free(&csv);
-    free(blob);
-    return 1;
-  }
-
-  uint32_t *output_columns = nullptr;
-  uint32_t output_count = 0u;
-  if (options.evaluate) {
-    if (!options.has_outputs) {
-      fprintf(stderr, "elml_run: --evaluate needs --outputs or model metadata\n");
-      free(input_columns);
-      elml_csv_free(&csv);
-      free(blob);
-      return 1;
-    }
-    status = elml_columns_resolve(options.outputs, &csv, &output_columns,
-                                  &output_count);
+  if (!options.repl && options.predict_text == nullptr &&
+      !options.use_stdin) {
+    /* CSV mode: the shared evaluator loads the model and the file. */
+    const elml_eval_options eval = {
+        .model_path = options.model_path,
+        .csv_path = options.csv_path,
+        .delimiter = options.delimiter,
+        .has_header = options.has_header,
+        .inputs = options.has_inputs ? options.inputs : nullptr,
+        .targets = options.has_outputs ? options.outputs : nullptr,
+        .score = options.evaluate,
+        .limit = options.limit,
+    };
+    elml_eval_result result;
+    status = elml_eval_run(&eval, &result);
     if (status != ELML_OK) {
-      fprintf(stderr, "elml_run: cannot resolve output columns: %s\n",
-              elml_error_string(status));
-      free(input_columns);
-      elml_csv_free(&csv);
-      free(blob);
+      fprintf(stderr, "elml_run: %s\n", result.message);
+      elml_eval_free(&result);
       return 1;
     }
-  }
 
-  const size_t scratch_bytes = elml_scratch_bytes(&model, 1u);
-  const size_t aligned_scratch = elml_align_up(scratch_bytes, ELML_TENSOR_ALIGN);
-  void *scratch = aligned_alloc(ELML_TENSOR_ALIGN, aligned_scratch);
-  if (scratch == nullptr) {
-    fprintf(stderr, "elml_run: out of memory\n");
-    free(output_columns);
-    free(input_columns);
-    elml_csv_free(&csv);
-    free(blob);
-    return 1;
-  }
-
-  float *input = (float *)malloc((size_t)input_dim * sizeof(float));
-  float *prediction = (float *)malloc((size_t)output_dim * sizeof(float));
-  if (input == nullptr || prediction == nullptr) {
-    fprintf(stderr, "elml_run: out of memory\n");
-    free(input);
-    free(prediction);
-    free(scratch);
-    free(output_columns);
-    free(input_columns);
-    elml_csv_free(&csv);
-    free(blob);
-    return 1;
-  }
-
-  FILE *output_file = nullptr;
-  if (options.output_path != nullptr) {
-    output_file = fopen(options.output_path, "wb");
-    if (output_file == nullptr) {
-      fprintf(stderr, "elml_run: cannot write %s\n", options.output_path);
-      free(input);
-      free(prediction);
-      free(scratch);
-      free(output_columns);
-      free(input_columns);
-      elml_csv_free(&csv);
-      free(blob);
-      return 1;
-    }
-    if (options.has_header) {
-      for (uint32_t col = 0u; col < csv.cols; ++col) {
-        if (col > 0u) {
-          fputc(options.delimiter, output_file);
-        }
-        const char *name = elml_csv_cell(&csv, 0u, col);
-        elml_write_field(output_file, (name != nullptr) ? name : "",
-                         options.delimiter);
-      }
-      if (label_count > 0u) {
-        fputc(options.delimiter, output_file);
-        elml_write_field(output_file, "prediction", options.delimiter);
-        char label[128];
-        for (uint32_t i = 0u; i < label_count; ++i) {
-          char column[160];
-          snprintf(column, sizeof column, "prob_%s",
-                   elml_target_label(&model, i, label, sizeof label));
-          fputc(options.delimiter, output_file);
-          elml_write_field(output_file, column, options.delimiter);
-        }
-      } else {
-        for (uint32_t o = 0u; o < output_dim; ++o) {
-          char column[64];
-          snprintf(column, sizeof column, "pred_%u", o);
-          fputc(options.delimiter, output_file);
-          elml_write_field(output_file, column, options.delimiter);
-        }
-      }
-      fputc('\n', output_file);
-    }
-  }
-
-  const uint32_t data_rows = csv.rows - csv.data_start;
-  const uint32_t row_limit =
-      (options.limit > 0u && options.limit < data_rows) ? options.limit
-                                                        : data_rows;
-
-  double loss_sum = 0.0;
-  double abs_sum = 0.0;
-  uint64_t loss_count = 0u;
-  uint64_t correct = 0u;
-  uint64_t counted = 0u;
-
-  for (uint32_t row = 0u; row < row_limit; ++row) {
-    const uint32_t csv_row = row + csv.data_start;
-
-    for (uint32_t i = 0u; i < input_dim; ++i) {
-      const char *cell = elml_csv_cell(&csv, csv_row, input_columns[i]);
-      if (elml_parse_cell(cell, &input[i]) != ELML_OK) {
-        fprintf(stderr, "elml_run: bad input value at row %u\n", csv_row + 1u);
-        free(input);
-        free(prediction);
-        free(scratch);
-        free(output_columns);
-        free(input_columns);
-        if (output_file != nullptr) {
-          fclose(output_file);
-        }
-        elml_csv_free(&csv);
-        free(blob);
+    if (options.output_path != nullptr) {
+      status = elml_eval_write_csv(&result, options.output_path);
+      if (status != ELML_OK) {
+        fprintf(stderr, "elml_run: cannot write %s\n", options.output_path);
+        elml_eval_free(&result);
         return 1;
       }
     }
 
-    status = elml_forward(&model, scratch, aligned_scratch, input, prediction);
-    if (status != ELML_OK) {
-      fprintf(stderr, "elml_run: inference failed: %s\n",
-              elml_error_string(status));
-      free(input);
-      free(prediction);
-      free(scratch);
-      free(output_columns);
-      free(input_columns);
-      if (output_file != nullptr) {
-        fclose(output_file);
-      }
-      elml_csv_free(&csv);
-      free(blob);
-      return 1;
-    }
-
-    if (options.evaluate) {
-      counted++;
-      if (label_count > 0u) {
-        const char *target =
-            elml_csv_cell(&csv, csv_row, output_columns[0]);
-        uint32_t best = 0u;
-        for (uint32_t i = 1u; i < output_dim; ++i) {
-          if (prediction[i] > prediction[best]) {
-            best = i;
-          }
-        }
-        char label[128];
-        size_t len = 0u;
-        if (target != nullptr) {
-          for (uint32_t i = 0u; i < label_count; ++i) {
-            if (elml_label_get(&model, i, label, sizeof label, &len) ==
-                    ELML_OK &&
-                strcmp(label, target) == 0) {
-              if (i == best) {
-                correct++;
-              }
-              break;
-            }
-          }
-        }
-      } else {
-        if (output_count != output_dim) {
-          fprintf(stderr,
-                  "elml_run: model expects %u outputs, %u columns given\n",
-                  output_dim, output_count);
-          free(input);
-          free(prediction);
-          free(scratch);
-          free(output_columns);
-          free(input_columns);
-          if (output_file != nullptr) {
-            fclose(output_file);
-          }
-          elml_csv_free(&csv);
-          free(blob);
-          return 1;
-        }
-        for (uint32_t o = 0u; o < output_dim; ++o) {
-          float target = 0.0f;
-          if (elml_parse_cell(elml_csv_cell(&csv, csv_row, output_columns[o]),
-                              &target) != ELML_OK) {
-            fprintf(stderr, "elml_run: bad target value at row %u\n",
-                    csv_row + 1u);
-            free(input);
-            free(prediction);
-            free(scratch);
-            free(output_columns);
-            free(input_columns);
-            if (output_file != nullptr) {
-              fclose(output_file);
-            }
-            elml_csv_free(&csv);
-            free(blob);
-            return 1;
-          }
-          const double diff = (double)prediction[o] - (double)target;
-          loss_sum += diff * diff;
-          abs_sum += fabs(diff);
-          loss_count++;
+    if (!options.quiet) {
+      printf("rows: %u\n", result.row_count);
+      if (options.evaluate) {
+        if (result.classification) {
+          const double accuracy =
+              (result.scored_rows == 0u)
+                  ? 0.0
+                  : ((double)result.correct / (double)result.scored_rows);
+          printf("accuracy: %.4f (%llu/%llu)\n", accuracy,
+                 (unsigned long long)result.correct,
+                 (unsigned long long)result.scored_rows);
+        } else {
+          printf("mse: %.6f\n", result.mse);
+          printf("rmse: %.6f\n", sqrt(result.mse));
+          printf("mae: %.6f\n", result.mae);
         }
       }
     }
 
-    if (output_file != nullptr) {
-      for (uint32_t col = 0u; col < csv.cols; ++col) {
-        if (col > 0u) {
-          fputc(options.delimiter, output_file);
-        }
-        const char *cell = elml_csv_cell(&csv, csv_row, col);
-        elml_write_field(output_file, (cell != nullptr) ? cell : "",
-                         options.delimiter);
-      }
-      if (label_count > 0u) {
-        uint32_t best = 0u;
-        for (uint32_t i = 1u; i < output_dim; ++i) {
-          if (prediction[i] > prediction[best]) {
-            best = i;
-          }
-        }
-        char label[128];
-        fputc(options.delimiter, output_file);
-        elml_write_field(output_file,
-                         elml_target_label(&model, best, label, sizeof label),
-                         options.delimiter);
-        for (uint32_t i = 0u; i < label_count; ++i) {
-          char value[64];
-          snprintf(value, sizeof value, "%.6f", (double)prediction[i]);
-          fputc(options.delimiter, output_file);
-          elml_write_field(output_file, value, options.delimiter);
-        }
-      } else {
-        for (uint32_t o = 0u; o < output_dim; ++o) {
-          char value[64];
-          snprintf(value, sizeof value, "%.6f", (double)prediction[o]);
-          fputc(options.delimiter, output_file);
-          elml_write_field(output_file, value, options.delimiter);
-        }
-      }
-      fputc('\n', output_file);
-    }
+    elml_eval_free(&result);
+    return 0;
   }
 
-  if (output_file != nullptr) {
-    fclose(output_file);
+  uint8_t *blob = nullptr;
+  elml_model model;
+  if (elml_run_load_model(options.model_path, &blob, &model) != 0) {
+    return 1;
   }
 
-  if (!options.quiet) {
-    printf("rows: %u\n", row_limit);
-    if (options.evaluate) {
-      if (label_count > 0u) {
-        const double accuracy =
-            (counted == 0u) ? 0.0 : ((double)correct / (double)counted);
-        printf("accuracy: %.4f (%llu/%llu)\n", accuracy,
-               (unsigned long long)correct, (unsigned long long)counted);
-      } else {
-        const double mse =
-            (loss_count == 0u) ? 0.0 : (loss_sum / (double)loss_count);
-        const double mae =
-            (loss_count == 0u) ? 0.0 : (abs_sum / (double)loss_count);
-        printf("mse: %.6f\n", mse);
-        printf("rmse: %.6f\n", sqrt(mse));
-        printf("mae: %.6f\n", mae);
-      }
-    }
+  if (options.repl) {
+    const int exit_code = elml_run_repl(&model, &options);
+    free(blob);
+    return exit_code;
   }
 
-  free(input);
-  free(prediction);
-  free(scratch);
-  free(output_columns);
-  free(input_columns);
-  elml_csv_free(&csv);
+  const int exit_code = elml_run_predict(&model, &options);
   free(blob);
-  return 0;
+  return exit_code;
 }

@@ -15,8 +15,8 @@ option(ELML_BUILD_TESTS "Build the test suite" ON)
 option(ELML_BUILD_EXAMPLES "Register the examples with CTest" ON)
 option(ELML_SIMD "Use architecture-specific SIMD kernels when available" ON)
 option(ELML_STRICT_FP "Force the scalar f32 path for reproducible results" OFF)
-option(ELML_BUILD_STUDIO "Build the CUI training studio (downloads CUI if needed)" OFF)
-set(ELML_CUI_SOURCE_DIR "" CACHE PATH "Local CUI checkout (optional)")
+option(ELML_BUILD_STUDIO "Build the CUI training studio (uses the CUI submodule)" OFF)
+set(ELML_CUI_SOURCE_DIR "" CACHE PATH "Local CUI checkout instead of the submodule (optional)")
 set(ELML_MAX_LAYERS "64" CACHE STRING "Maximum number of layers per model")
 set(ELML_MAX_RANK "4" CACHE STRING "Maximum tensor rank")
 
@@ -98,6 +98,7 @@ if(ELML_TRAIN)
     src/train/config.c
     src/train/dataset.c
     src/train/net.c
+    src/train/evaluate.c
     src/train/session.c
     src/train/export.c)
 
@@ -153,15 +154,16 @@ if(ELML_BUILD_STUDIO)
   set(CUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(CUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   if(ELML_CUI_SOURCE_DIR)
-    add_subdirectory(${ELML_CUI_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/cui)
+    set(ELML_CUI_DIR "${ELML_CUI_SOURCE_DIR}")
   else()
-    include(FetchContent)
-    FetchContent_Declare(cui
-      GIT_REPOSITORY https://github.com/yappologistic/CUI.git
-      GIT_TAG d0383c4d3c00b7769f6b11cefdf581e1800f2da3
-      GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(cui)
+    set(ELML_CUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/CUI")
   endif()
+  if(NOT EXISTS "${ELML_CUI_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+      "CUI sources not found at ${ELML_CUI_DIR}. Initialize the submodule "
+      "with: git submodule update --init --recursive")
+  endif()
+  add_subdirectory("${ELML_CUI_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/cui")
 
   add_executable(elml_studio src/studio/studio_main.c)
   target_link_libraries(elml_studio PRIVATE elml_train_lib cui::cui Threads::Threads m)

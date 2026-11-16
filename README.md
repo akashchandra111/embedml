@@ -79,7 +79,7 @@ Useful options:
 | `ELML_SIMD` | `ON` | Build the kernel for the target architecture (x86_64 AVX2/FMA, arm64 NEON, RISC-V RVV) |
 | `ELML_STRICT_FP` | `OFF` | Force the scalar f32 path |
 | `ELML_BUILD_STUDIO` | `OFF` | Build the CUI desktop training studio |
-| `ELML_CUI_SOURCE_DIR` | empty | Use a local CUI checkout instead of downloading it |
+| `ELML_CUI_SOURCE_DIR` | empty | Use a local CUI checkout instead of the `third_party/CUI` submodule |
 | `ELML_MAX_LAYERS` | `64` | Maximum layers per model |
 | `ELML_MAX_RANK` | `4` | Maximum tensor rank |
 
@@ -167,13 +167,23 @@ after every epoch. Loading an `.ini` fills the form and resolves its relative
 data and export paths next to the configuration file.
 
 ```sh
+git submodule update --init --recursive
 cmake -S . -B build-studio -DELML_BUILD_STUDIO=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-studio -j
 ./build-studio/elml_studio
 ```
 
-The first configure downloads CUI at a pinned commit. To build against an
-existing checkout instead (offline development, or to modify CUI):
+CUI lives in `third_party/CUI` as a git submodule pinned to the v1.4.0
+release. To build a newer CUI revision, move the submodule and stage the change:
+
+```sh
+git -C third_party/CUI fetch origin
+git -C third_party/CUI checkout origin/master
+git add third_party/CUI
+```
+
+To build against an existing checkout instead (offline development, or to
+modify CUI in place):
 
 ```sh
 cmake -S . -B build-studio -DELML_BUILD_STUDIO=ON \
@@ -192,16 +202,36 @@ check runs before training. Headerless files show `Column 1`, `Column 2`, and
 so on and pass 1-based indices to the trainer. Use **Rescan CSV columns** after
 editing the file header by hand.
 
+The **Evaluate** tab checks a saved model without retraining. Choose an `.elml`
+file and a CSV, or point at the same `.ini` and press **Load** to fill the
+model, data, columns, header, and delimiter from the training configuration.
+Input and target columns use the same CSV-header multi-select pickers as the
+Training tab, so a name cannot be mistyped; leaving both empty uses the columns
+stored in the model. **Use training data & export** copies the current training
+paths and selections, and the last exported model is filled in automatically.
+Evaluation runs on a background thread and reports accuracy and the number of
+correct rows for classification, or MSE/RMSE/MAE for regression. Every row is
+listed with its target, prediction, confidence, and a Correct/Wrong badge;
+**Incorrect only** filters the table, and **Save predictions** writes the source
+columns plus the predictions and class probabilities (or `pred_N` for
+regression).
+
 Useful flags:
 
 ```sh
 ./build-studio/elml_studio --config examples/wdbc/wdbc.ini
 ./build-studio/elml_studio --autostart   # start as soon as the window opens
+./build-studio/elml_studio --evaluate    # open the Evaluate tab
+./build-studio/elml_studio --config examples/iris/iris.ini --autoeval
 ```
 
 Press **Stop and export best** at any time. The best monitored epoch is
 restored and written to the configured `.elml` path; the same export happens
 automatically when training finishes or early-stops.
+
+The window only redraws when it has something to show: animations and hover
+effects run at full speed, an active run refreshes at a readable pace, and an
+idle window drops to a slow tick so it stays near 0% CPU.
 
 ## Single-row prediction
 
