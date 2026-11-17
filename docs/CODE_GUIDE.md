@@ -901,6 +901,10 @@ manager.
 * `web/index.html`, `web/style.css`: page chrome around the canvas; the studio
   itself is drawn entirely by CUI.
 * `serve.sh`: serves the output directory with Python's `http.server`.
+* `pages.sh`: copies an existing `build-web/` into `docs/` for GitHub Pages,
+  adds `docs/.nojekyll`, and prints the manual commit/push steps. It copies only
+  the page assets and `samples/`, never `obj/` or `libcui.a`. `ELML_WEB_OUT`
+  and `ELML_PAGES_OUT` override the source and destination.
 * `test.mjs`: Node smoke test. It instantiates the module, registers the iris
   sample, drives one frame per epoch, asserts the export, evaluates the model,
   and prints the result. It uses no browser and no test framework.

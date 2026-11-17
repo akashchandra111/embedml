@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>embedlml studio</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" aria-hidden="true"></span>
+      <div>
+        <h1>embedlml studio</h1>
+        <p>Train and evaluate a small neural network in the browser.</p>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="btn-sample" type="button" class="ghost">Load iris sample</button>
+      <button id="btn-train" type="button" class="primary">Train</button>
+      <button id="btn-stop" type="button" class="ghost" disabled>Stop</button>
+      <button id="btn-eval" type="button" class="ghost">Evaluate</button>
+      <button id="btn-download-model" type="button" class="ghost" disabled>Download model</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="stage">
+      <div id="canvas-wrap" class="canvas-wrap">
+        <canvas id="canvas" tabindex="0" aria-label="embedlml studio"></canvas>
+      </div>
+      <p id="status" class="status" role="status">Loading the studio...</p>
+      <p id="eval-status" class="status muted">No evaluation yet.</p>
+    </section>
+
+    <aside class="side">
+      <section class="card">
+        <h2>Run</h2>
+        <dl class="kpis">
+          <div><dt>Epoch</dt><dd id="kpi-epoch">—</dd></div>
+          <div><dt>Loss</dt><dd id="kpi-loss">—</dd></div>
+          <div><dt>Accuracy</dt><dd id="kpi-accuracy">—</dd></div>
+          <div><dt>Best epoch</dt><dd id="kpi-best">—</dd></div>
+          <div class="wide"><dt>Model</dt><dd id="kpi-model">—</dd></div>
+          <div class="wide"><dt>Train / validation rows</dt><dd id="kpi-rows">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="card">
+        <h2>Files</h2>
+        <p class="hint">Files live in the page while it is open. Pick one below or use the Browse buttons in the studio.</p>
+        <div class="pickers">
+          <label class="pick">Configuration
+            <input id="file-config" type="file" accept=".ini,text/plain">
+          </label>
+          <label class="pick">Training CSV
+            <input id="file-train" type="file" accept=".csv,text/plain">
+          </label>
+          <label class="pick">Validation CSV
+            <input id="file-val" type="file" accept=".csv,text/plain">
+          </label>
+          <label class="pick">Model
+            <input id="file-model" type="file" accept=".elml,.bin,application/octet-stream">
+          </label>
+          <label class="pick">Evaluation CSV
+            <input id="file-eval" type="file" accept=".csv,text/plain">
+          </label>
+        </div>
+        <ul id="file-list" class="files">
+          <li class="empty">No files loaded yet.</li>
+        </ul>
+      </section>
+
+      <section class="card note">
+        <h2>How it works</h2>
+        <p>The studio is a single WebAssembly module built from the same C sources as the desktop app. Training runs one epoch per animation frame, and predictions are written to the in-memory file table, where the Files panel can download them.</p>
+      </section>
+    </aside>
+  </main>
+
+  <script type="module" src="studio.js"></script>
+</body>
+</html>
