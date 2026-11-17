@@ -1,5 +1,5 @@
 /*
- * EmbedLML public umbrella header.
+ * EmbedML public umbrella header.
  *
  * Link against libelml_core for inference. The trainer, quantizer and host
  * tools are separate binaries; none of their code is pulled in here.

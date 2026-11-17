@@ -1,6 +1,6 @@
-# EmbedLML
+# EmbedML
 
-EmbedLML is a small, portable neural-network library and toolchain for embedded
+EmbedML is a small, portable neural-network library and toolchain for embedded
 targets. You train a model on a host machine from CSV data, export a single
 versioned binary file, and run inference on an MCU from a read-only blob in
 flash with no `malloc`, no `stdio`, and no floating-point file I/O.
@@ -283,6 +283,25 @@ ELML_WASM_SIMD=0 ./wasm/build.sh
 sample, drives one frame per epoch, checks the export, and evaluates the model.
 It needs no browser and no test framework. `ELML_WEB_OUT` and `PORT` choose a
 different output directory or server port.
+
+### Publishing to GitHub Pages
+
+`wasm/pages.sh` copies an existing `build-web/` into `docs/`, which GitHub
+Pages can serve directly. It does not build and it does not run git:
+
+```sh
+./wasm/build.sh          # build (or reuse a previous build-web/)
+./wasm/pages.sh          # copy the page, module, and samples into docs/
+git add docs
+git commit -m "Publish the browser studio"
+git push
+```
+
+Then enable **Settings → Pages → Deploy from a branch**, branch `main`, folder
+`/docs`. Only the page assets and `samples/` are copied; `build-web/obj/` and
+`libcui.a` stay out. The script also writes `docs/.nojekyll` so the static files
+are served as-is. `ELML_PAGES_OUT` publishes somewhere else, and
+`ELML_WEB_OUT` chooses a different build directory.
 
 ## Single-row prediction
 

@@ -50,7 +50,7 @@ int main(void)
     CHECK(strlen(text) > 0u);
   }
   CHECK_STR(elml_error_string((elml_status)-999), "unknown error");
-  CHECK(strstr(elml_version_string(), "EmbedLML") != NULL);
+  CHECK(strstr(elml_version_string(), "EmbedML") != NULL);
 
   static const float weights[2] = {1.0f, 2.0f};
   static const float biases[1] = {0.0f};

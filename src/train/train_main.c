@@ -119,10 +119,10 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  printf("embedlml: %u train / %u validation rows, %u -> %u\n",
+  printf("embedml: %u train / %u validation rows, %u -> %u\n",
          training.train.rows, training.val.rows, training.train.input_dim,
          training.train.output_dim);
-  printf("embedlml: layers");
+  printf("embedml: layers");
   for (uint32_t i = 0u; i < training.net.layer_count; ++i) {
     printf(" %u", training.net.layers[i].out_dim);
   }

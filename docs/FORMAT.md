@@ -1,4 +1,4 @@
-# EmbedLML model format v1.0
+# EmbedML model format v1.0
 
 This document specifies the binary model file consumed by `libelml_core`. It is
 the normative reference for the writer in `src/format/write.c` and the parser in
@@ -252,7 +252,7 @@ u8  value[value_len]
 ```
 
 Keys and values are UTF-8 byte strings and are not NUL-terminated in the file.
-The writer always emits `producer = "EmbedLML 0.1.0"` and may emit:
+The writer always emits `producer = "EmbedML 0.1.0"` and may emit:
 
 | Key | Value |
 | --- | --- |

@@ -1,7 +1,7 @@
 /*
  * C23 -> C11 compatibility shim.
  *
- * EmbedLML targets C23. Vendor MCU toolchains occasionally lag behind, so the
+ * EmbedML targets C23. Vendor MCU toolchains occasionally lag behind, so the
  * public headers remain usable with C11 by providing the handful of spellings
  * that the implementation relies on. Do not add feature logic here.
  */

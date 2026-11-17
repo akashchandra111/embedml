@@ -1,7 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 /*
- * elml_studio: a CUI desktop frontend for the embedlml trainer.
+ * elml_studio: a CUI desktop frontend for the embedml trainer.
  *
  * The window is split in two. The left panel edits the same parameters the
  * command-line trainer accepts; the right panel shows live loss and accuracy
@@ -2114,7 +2114,7 @@ static bool studio_sidebar(cui_ctx *ui, studio_state *state, bool running)
     cui_column(ui, .width = CUI_FILL, .pad = 20, .gap = 4) {
       cui_row(ui, .width = CUI_FILL, .align = CUI_ALIGN_CENTER, .gap = 10) {
         cui_icon(ui, CUI_ICON_LAYERS, 22, CUI_COLOR_ACCENT);
-        cui_text(ui, "embedlml", .font = CUI_FONT_DISPLAY, .size = 20);
+        cui_text(ui, "embedml", .font = CUI_FONT_DISPLAY, .size = 20);
       }
       cui_secondary(ui, "Training studio");
     }
@@ -2263,7 +2263,7 @@ static bool studio_sidebar(cui_ctx *ui, studio_state *state, bool running)
       studio_section(ui, "EXPORT");
       studio_path_field(ui, state, "export_path", "Model output",
                         state->export_path, sizeof state->export_path,
-                        CUI_FILE_SAVE, "embedlml models", "elml",
+                        CUI_FILE_SAVE, "embedml models", "elml",
                         "Where the best weights are written after training "
                         "finishes or you press Stop.",
                         running);
@@ -2851,7 +2851,7 @@ static bool studio_eval_controls(cui_ctx *ui, studio_state *state)
 
     studio_path_field(ui, state, "eval_model_path", "Saved model (.elml)",
                       state->eval_model_path, sizeof state->eval_model_path,
-                      CUI_FILE_OPEN, "embedlml models", "elml",
+                      CUI_FILE_OPEN, "embedml models", "elml",
                       "The model exported by training, or any other .elml.",
                       running);
     studio_path_field(ui, state, "eval_csv_path", "CSV to check",
@@ -3071,6 +3071,32 @@ static void studio_eval_column_names(const elml_eval_result *result,
   }
 }
 
+static void studio_model_shape(const elml_model *model, char *out, size_t cap)
+{
+  if (model == nullptr || out == nullptr || cap == 0u) {
+    return;
+  }
+  int written = snprintf(out, cap, "%u", model->input.dim[0]);
+  if (written < 0) {
+    out[0] = '\0';
+    return;
+  }
+  size_t used = (size_t)written;
+  for (uint16_t i = 0u; i < model->layer_count && used < cap; ++i) {
+    /* Activation/softmax descriptors have no parameters; skip them so the
+     * chain shows the same weight layers the trainer reports. */
+    if (model->descs[i].param_off == UINT32_MAX) {
+      continue;
+    }
+    written = snprintf(out + used, cap - used, " -> %u",
+                       model->descs[i].out.dim[0]);
+    if (written < 0 || (size_t)written >= cap - used) {
+      break;
+    }
+    used += (size_t)written;
+  }
+}
+
 static void studio_eval_model_card(cui_ctx *ui, const studio_state *state)
 {
   const elml_eval_result *result = &state->eval_result;
@@ -3087,11 +3113,8 @@ static void studio_eval_model_card(cui_ctx *ui, const studio_state *state)
     }
 
     studio_detail(ui, "Model", state->eval_model_path);
-    char shape[96];
-    snprintf(shape, sizeof shape, "%u input%s -> %u output%s",
-             result->model.input.dim[0],
-             (result->model.input.dim[0] == 1u) ? "" : "s", result->output_dim,
-             (result->output_dim == 1u) ? "" : "s");
+    char shape[160];
+    studio_model_shape(&result->model, shape, sizeof shape);
     studio_detail(ui, "Shape", shape);
 
     char input_names[ELML_CONFIG_LIST_MAX];
@@ -3836,7 +3859,7 @@ int main(int argc, char **argv)
    */
   studio_web_current = state;
   (void)cui_app_run(&(cui_app_desc){
-                        .title = "embedlml studio",
+                        .title = "embedml studio",
                         .width = 1320,
                         .height = 880,
                         .theme = CUI_THEME_DARK,
@@ -3853,7 +3876,7 @@ int main(int argc, char **argv)
   }
 
   cui_app *app = cui_app_create(&(cui_app_desc){
-      .title = "embedlml studio",
+      .title = "embedml studio",
       .width = 1320,
       .height = 880,
       .min_width = 860,

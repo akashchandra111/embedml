@@ -1,4 +1,4 @@
-// Loads the embedlml studio wasm module and provides the small host shim it
+// Loads the embedml studio wasm module and provides the small host shim it
 // expects (libc + CUI's browser host). This is a trimmed copy of CUI's
 // site/js/runtime.js with one extra import: js_studio_pick_file, which the
 // studio uses to ask the page for a file. No dependencies, works in a browser
@@ -65,7 +65,7 @@ export async function loadStudio(source, hooks = {}) {
     js_perf_now: () => performance.now(),
     js_tz_offset: (ms) => -new Date(ms).getTimezoneOffset(),
     js_abort(p) {
-      throw new Error(`embedlml studio aborted: ${str(p)}`);
+      throw new Error(`embedml studio aborted: ${str(p)}`);
     },
     // The studio asks the page for a file. kinds: 0 config, 1 train CSV,
     // 2 validation CSV, 3 model, 4 evaluation CSV.

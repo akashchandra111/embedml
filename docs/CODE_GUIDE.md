@@ -1,6 +1,6 @@
 # Code guide
 
-This guide describes every source file and every function in EmbedLML. It is
+This guide describes every source file and every function in EmbedML. It is
 organized by directory and follows the dependency direction: public API, then
 inference core, format, kernels, host trainer, runner, tools, tests, and
 examples.
@@ -166,7 +166,7 @@ Implements the monotonic arena.
 
 * `elml_error_string(status)`: maps every `elml_status` to a stable
   human-readable name; unknown values return `"unknown error"`.
-* `elml_version_string()`: returns `"EmbedLML <major>.<minor>.<patch>"`.
+* `elml_version_string()`: returns `"EmbedML <major>.<minor>.<patch>"`.
 
 ### `registry.c`
 
@@ -833,9 +833,10 @@ checking a saved model against a CSV.
   `studio_eval_table`: draw the model and CSV pickers, `.ini` loader, header,
   delimiter and scoring switches, the same CSV-header multi-select pickers the
   Training tab uses (empty means "use the model metadata"), accuracy or
-  MSE/RMSE/MAE cards, model details with resolved column names, and the per-row
-  table with the **Incorrect only** filter. The table caps the display at
-  `eval_display_limit` rows and points at the saved CSV for the rest.
+  MSE/RMSE/MAE cards, model details with the input -> hidden -> output shape
+  chain and resolved column names, and the per-row table with the **Incorrect
+  only** filter. The table caps the display at `eval_display_limit` rows and
+  points at the saved CSV for the rest.
 * `studio_eval_save`: writes the current result through
   `elml_eval_write_csv` after a save dialog. In the browser there is no dialog:
   it writes `predictions.csv` into `memfs`, where the Files panel can download
@@ -883,7 +884,7 @@ manager.
 
 * `build.sh`: compiles CUI's `src/cui_*.c`, `render/cui_render_sw.c`, the wasm
   shim (`third_party/CUI/web/shim/libc.c`), the browser host
-  (`web_host.c`, `web_app.c`), and embedlml's core/trainer/studio with
+  (`web_host.c`, `web_app.c`), and embedml's core/trainer/studio with
   `--target=wasm32`. It links with `wasm-ld`, copies the page and the iris
   sample into the output directory, and reports the module size. `CC`,
   `WASM_LD`, `LLVM_AR`, `JOBS`, `ELML_WEB_OUT`, and `ELML_WASM_SIMD` override

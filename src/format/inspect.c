@@ -100,7 +100,7 @@ static void elml_json_string(FILE *out, const uint8_t *data, uint32_t len)
 
 static void elml_print_header_text(const elml_format *format, FILE *out)
 {
-  fprintf(out, "EmbedLML model\n");
+  fprintf(out, "EmbedML model\n");
   fprintf(out, "  format       : %u.%u\n", (unsigned)format->major,
           (unsigned)format->minor);
   fprintf(out, "  dtype        : %s\n", elml_dtype_name(format->dtype));

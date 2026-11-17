@@ -1,4 +1,4 @@
-// The browser front end for the embedlml studio wasm module.
+// The browser front end for the embedml studio wasm module.
 //
 // CUI draws the studio into a software surface; this file copies that surface
 // to a canvas and forwards mouse, wheel and keyboard input. Training runs one

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(embedlml
+project(embedml
   VERSION 0.1.0
   DESCRIPTION "Portable neural-network inference and training for embedded systems"
   LANGUAGES C)

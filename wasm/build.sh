@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the embedlml studio for the browser.
+# Builds the embedml studio for the browser.
 #
 #   wasm/build.sh                 build build-web/elml_studio.wasm + the page
 #   ELML_WASM_SIMD=0 wasm/build.sh   scalar kernels instead of SIMD128
@@ -7,7 +7,7 @@
 #
 # Plain clang + wasm-ld, no Emscripten and no downloaded sysroot. CUI's own
 # wasm preview shim provides libc; this script reuses it and adds the
-# embedlml trainer and studio on top.
+# embedml trainer and studio on top.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -33,6 +33,7 @@ BASE_FLAGS=(--target=wasm32 -O2 -g0
             -fno-stack-protector -fno-exceptions
             -ffunction-sections -fdata-sections
             -mbulk-memory -mnontrapping-fptoint -msign-ext
+            -ffile-prefix-map="$ROOT/"=
             -isystem "$CUI/web/shim/include")
 
 CUI_FLAGS=(-std=c99 -msimd128
@@ -91,7 +92,7 @@ wait
 rm -f "$OUT/libcui.a"
 "$AR" rcs "$OUT/libcui.a" "${CUI_OBJS[@]}"
 
-# ---- embedlml core, trainer and studio ------------------------------------
+# ---- embedml core, trainer and studio ------------------------------------
 APP_SRCS=(
     src/core/arena.c
     src/core/error.c
@@ -148,3 +149,4 @@ printf 'built %s (%s KB, SIMD %s)\n' \
     "$(( $(stat -c %s "$OUT/elml_studio.wasm") / 1024 ))" \
     "$([[ "$SIMD" == "1" ]] && echo on || echo off)"
 printf 'serve it with: %s/serve.sh\n' "$HERE"
+printf 'publish to docs/ with: %s/pages.sh\n' "$HERE"

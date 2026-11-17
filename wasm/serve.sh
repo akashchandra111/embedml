@@ -19,5 +19,5 @@ if [[ ! -f "$DIR/elml_studio.wasm" ]]; then
     exit 1
 fi
 
-echo "embedlml studio: http://127.0.0.1:$PORT/"
+echo "embedml studio: http://127.0.0.1:$PORT/"
 exec python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$DIR"
