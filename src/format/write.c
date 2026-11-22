@@ -407,7 +407,7 @@ static elml_status elml_write_meta_entry(elml_buf *meta, const char *key,
 static elml_status elml_write_meta_chunk(const elml_write_spec *spec, elml_buf *meta)
 {
   elml_status status =
-      elml_write_meta_entry(meta, "producer", "EmbedML 0.1.0");
+      elml_write_meta_entry(meta, "producer", "EmbedML " ELML_VERSION_STRING);
   if (status != ELML_OK) {
     return status;
   }

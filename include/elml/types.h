@@ -17,13 +17,15 @@
 extern "C" {
 #endif
 
-#ifndef ELML_MAX_LAYERS
-#  define ELML_MAX_LAYERS 64
-#endif
-
-#ifndef ELML_MAX_RANK
-#  define ELML_MAX_RANK 4
-#endif
+/*
+ * ABI constants, not build options. `elml_model` and `elml_shape` embed arrays
+ * of these sizes, so a library compiled with different values than the
+ * consumer's headers would silently change the struct layout and corrupt
+ * memory. Keep them fixed; the trainer itself is limited to 31 hidden layers
+ * plus one output layer.
+ */
+#define ELML_MAX_LAYERS 64
+#define ELML_MAX_RANK 4
 
 /* Parameter blobs in a model file start on 64-byte absolute offsets. */
 #define ELML_PARAM_ALIGN 64u

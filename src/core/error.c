@@ -50,5 +50,5 @@ const char *elml_error_string(elml_status status)
 
 const char *elml_version_string(void)
 {
-  return "EmbedML 0.1.0 (format 1.0)";
+  return "EmbedML " ELML_VERSION_STRING " (format 1.0)";
 }

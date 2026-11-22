@@ -17,7 +17,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 SRC="${ELML_WEB_OUT:-$ROOT/build-web}"
 DEST="${ELML_PAGES_OUT:-$ROOT/docs}"
 
-# Only the page assets are published. build-web/ also holds obj/ and libcui.a,
+# Only the page assets are published. build-web/ also holds obj-*/ and libcui.a,
 # which must not end up in docs/.
 FILES=(index.html style.css loader.js studio.js elml_studio.wasm)
 
@@ -54,7 +54,7 @@ Publish it by hand:
 Then enable Settings -> Pages -> Deploy from a branch: main, folder /docs.
 The studio serves at https://<owner>.github.io/embedml/.
 
-Only the page files and samples/ are copied; build-web/obj/ and libcui.a stay
+Only the page files and samples/ are copied; build-web/obj-*/ and libcui.a stay
 out of docs/. Re-run ./wasm/build.sh then this script whenever the page or the
 wasm module changes.
 EOF

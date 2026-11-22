@@ -42,8 +42,12 @@ Defines the project, options, warning set, and targets.
 * CUI is vendored as the `third_party/CUI` git submodule. `ELML_CUI_SOURCE_DIR`
   overrides it with another checkout, and configure fails with an
   initialization hint when the submodule is missing.
-* `ELML_MAX_LAYERS` and `ELML_MAX_RANK` are public compile definitions so the
-  public structs and the parser agree.
+* `ELML_MAX_LAYERS` and `ELML_MAX_RANK` are fixed ABI constants in
+  `include/elml/types.h`, not cache options. The public structs embed arrays of
+  those sizes, so a library built with different values would change their
+  layout and corrupt memory.
+* `ELML_SANITIZE` instruments the library, tests, studio, and iris/WDBC demos
+  with AddressSanitizer and UndefinedBehaviorSanitizer.
 * Tests and the iris example are only registered when `ELML_TRAIN` is on.
 
 ### `tests/CMakeLists.txt`
@@ -74,8 +78,9 @@ C23-to-C11 spelling shim. When the compiler is not C23 and not C++, it defines
 
 Core value types and limits.
 
-* `ELML_MAX_LAYERS` (default 64) and `ELML_MAX_RANK` (default 4), overridable by
-  the build.
+* `ELML_MAX_LAYERS` = 64 and `ELML_MAX_RANK` = 4. These are fixed ABI limits,
+  not build options, because `elml_model` and `elml_shape` embed arrays of
+  those sizes.
 * `ELML_PARAM_ALIGN` = 64 (model blob and parameter alignment).
 * `ELML_TENSOR_ALIGN` = 16 (scratch alignment).
 * `elml_status`: every error code used by the library.
@@ -84,6 +89,14 @@ Core value types and limits.
 * `elml_quant`: int8 scale and zero point.
 * `elml_tensor`: data pointer, dtype, shape, quantizer for kernel calls.
 * Compile-time assertions validate the configurable limits.
+
+### `version.h`
+
+`ELML_VERSION_MAJOR`, `ELML_VERSION_MINOR`, and `ELML_VERSION_PATCH` are the
+single source of truth for the library version. `ELML_VERSION_STRING` stringifies
+them; `CMakeLists.txt` parses the same numbers for `project(embedml VERSION ...)`,
+and the writer plus `elml_version_string()` use the macro, so the values cannot
+drift apart.
 
 ### `arena.h`
 
@@ -166,7 +179,8 @@ Implements the monotonic arena.
 
 * `elml_error_string(status)`: maps every `elml_status` to a stable
   human-readable name; unknown values return `"unknown error"`.
-* `elml_version_string()`: returns `"EmbedML <major>.<minor>.<patch>"`.
+* `elml_version_string()`: returns `"EmbedML <version> (format <major>.<minor>)"`
+  using `ELML_VERSION_STRING` from `version.h`.
 
 ### `registry.c`
 
@@ -455,9 +469,9 @@ the toolchain.
 
 SIMD128 equivalents of the three dense kernels, built by `wasm/build.sh` when
 the module is compiled with `-msimd128` (the default; set `ELML_WASM_SIMD=0`
-for the scalar path). Base wasm SIMD has no fused multiply-add, so each vector
-step is a multiply and an add, followed by a lane-shuffled horizontal sum and a
-scalar tail.
+for a completely scalar module, CUI included). Base wasm SIMD has no fused
+multiply-add, so each vector step is a multiply and an add, followed by a
+lane-shuffled horizontal sum and a scalar tail.
 
 
 ---
@@ -771,6 +785,9 @@ checking a saved model against a CSV.
 
 * `studio_snapshot` / `studio_view`: shared run state copied from the worker
   under a mutex once per frame; the view owns the chart arrays handed to CUI.
+  `studio_take_view` also captures the last two raw points for the KPI deltas,
+  then decimates the copied history to at most `STUDIO_CHART_MAX` (512) points
+  so a long run does not redraw thousands of segments per frame.
 * `studio_state`: UI parameters, the active `cui_ctx`, training session pointer,
   worker thread and mutex (host), the cooperative `web_training` session and
   `web_job_active` flag (wasm), chart history, column-picker state for both
@@ -804,7 +821,8 @@ checking a saved model against a CSV.
 * `studio_build_config`: synthesizes the equivalent CLI argv and calls
   `elml_config_load`, so validation and finalization are identical to the CLI.
 * `studio_progress`: mutex-protected epoch callback; appends loss/accuracy
-  history for the charts.
+  history for the charts and records elapsed time, epochs per second, and an
+  ETA derived from the average epoch time.
 * `studio_job_prepare` / `studio_job_finish`: shared job setup and completion.
   Prepare initializes the session and publishes rows, dimensions, model shape,
   and the export path. Finish exports the best weights and publishes final
@@ -812,9 +830,11 @@ checking a saved model against a CSV.
   numbers. Both are used by the host worker and the browser pump.
 * `studio_worker`: host only. Owns the `elml_training` session, runs
   `elml_training_run` on a pthread, then calls finish.
-* `studio_web_pump`: wasm only. Calls `elml_training_step_epoch` once per frame,
-  publishes the same metrics the progress callback would, requests a redraw,
-  and destroys the session on the step that reports `done`.
+* `studio_web_pump`: wasm only. Runs `elml_training_step_epoch` repeatedly
+  within an ~8 ms frame slice (at least one epoch, at most 256), publishes the
+  same metrics the progress callback would, requests a redraw, and destroys the
+  session on the step that reports `done`. Small datasets finish a whole run in
+  a couple of frames instead of one epoch per frame.
 * `studio_start` / `studio_stop` / `studio_shutdown`: on the host, create/join
   the worker thread with `pthread_create` / `pthread_join` and request a stop
   through `elml_training_request_stop`. In the browser, start prepares the
@@ -904,7 +924,7 @@ manager.
 * `serve.sh`: serves the output directory with Python's `http.server`.
 * `pages.sh`: copies an existing `build-web/` into `docs/` for GitHub Pages,
   adds `docs/.nojekyll`, and prints the manual commit/push steps. It copies only
-  the page assets and `samples/`, never `obj/` or `libcui.a`. `ELML_WEB_OUT`
+  the page assets and `samples/`, never `obj-*/` or `libcui.a`. `ELML_WEB_OUT`
   and `ELML_PAGES_OUT` override the source and destination.
 * `test.mjs`: Node smoke test. It instantiates the module, registers the iris
   sample, drives one frame per epoch, asserts the export, evaluates the model,
@@ -1071,6 +1091,36 @@ behavior, metadata and label lookups on a model without metadata, batch argument
 validation, dtype probing (including reserved f16 and representable int8), and
 header truncation/bad magic.
 
+### `test_memfs.c`
+
+Exercises the in-memory file table used by the browser build: put/get/remove and
+clear, path normalization (leading `/`, `./`, repeated slashes), overwrite and
+empty payloads, invalid names, capacity limits, and slot reuse after removal.
+The table is compiled on the host too, so these paths are tested without a
+browser.
+
+### `test_session.c`
+
+Drives `elml_training_*` end to end: prepare a split dataset, step one epoch at
+a time, run to completion, export and reload the model, forward a row, verify
+stop-before-first-epoch and deterministic early stop, exercise the progress
+callback, use an explicit validation CSV, and check missing-data and null
+argument errors.
+
+### `test_export.c`
+
+Exports a trained network with and without normalization statistics, reloads
+both models, and verifies layer counts, shapes, normalization parameters,
+labels, metadata (`task`, `loss`, `columns.*`), and a forward pass. Also covers
+argument validation and the absence of optional metadata.
+
+### `test_evaluate.c`
+
+Covers classification and regression evaluation: metadata fallback, explicit
+column names and 1-based indices, row limits, `skip_bad_rows`, target-column
+validation, error messages, prediction CSV output, label/output helpers, and
+MSE/MAE accumulation.
+
 ### `test_cli.sh`
 
 End-to-end CLI regression test. Generates a synthetic linear dataset, trains via
@@ -1105,7 +1155,8 @@ rate 0.01, L2 0.0001, early stop 50, export `iris.elml`.
 Complete pipeline: check the build, train, evaluate on the full CSV, inspect the
 model, parse the accuracy and enforce `>= 0.90`, embed the model into a C header,
 compile the MCU-style demo plus host checker, and run it. Accepts an optional
-build directory as the first argument.
+build directory as the first argument. `CC`, `CFLAGS`, and `LDFLAGS` are
+honoured, so sanitizer and coverage builds instrument the demo as well.
 
 ### `embed_model.py`
 
@@ -1220,7 +1271,7 @@ main (train_main.c)
 The studio follows the same path. `studio_build_config` synthesizes CLI
 arguments and calls `elml_config_load`; `studio_worker` owns the session behind
 the shared `elml_train` library on the host, while the browser calls
-`elml_training_step_epoch` once per animation frame through `studio_web_pump`.
+`elml_training_step_epoch` in time-sliced batches from `studio_web_pump`.
 
 ### Loading and inference
 

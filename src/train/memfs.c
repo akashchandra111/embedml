@@ -6,8 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(ELML_WASM)
-
 #define ELML_MEMFS_PATH_MAX 192
 
 typedef struct elml_memfs_entry {
@@ -192,5 +190,3 @@ size_t elml_memfs_size(int index)
   }
   return 0u;
 }
-
-#endif /* ELML_WASM */

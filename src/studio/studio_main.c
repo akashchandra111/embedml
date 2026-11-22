@@ -49,6 +49,10 @@
 #define STUDIO_PATH_MAX ELML_CONFIG_PATH_MAX
 #define STUDIO_LIST_MAX ELML_CONFIG_LIST_MAX
 #define STUDIO_HISTORY_MAX 8192
+/* Points handed to the chart widgets. The full history is kept for deltas and
+ * future resampling, but drawing thousands of points per frame is wasteful in
+ * the browser and unreadable on screen. */
+#define STUDIO_CHART_MAX 512
 #define STUDIO_ARG_MAX 48
 
 #if defined(ELML_WASM)
@@ -84,6 +88,9 @@ typedef struct studio_snapshot {
   float final_val_loss;
   float final_val_accuracy;
   bool has_final_accuracy;
+  double elapsed_seconds;
+  double epochs_per_second;
+  double eta_seconds;
   char model[256];
   char algorithm[96];
   char export_path[STUDIO_PATH_MAX];
@@ -95,7 +102,13 @@ typedef struct studio_view {
   studio_snapshot snap;
   bool running;
   int history_count;
+  int chart_count;
   bool has_accuracy_history;
+  bool has_previous_metrics;
+  float previous_loss;
+  float last_loss;
+  float previous_accuracy;
+  float last_accuracy;
 } studio_view;
 
 typedef struct studio_columns {
@@ -140,6 +153,7 @@ typedef struct studio_state {
 
   bool running;
   bool finished;
+  double started_at; /* monotonic seconds; guarded by the mutex */
   elml_training *active;
   elml_config pending;
   studio_snapshot snap;
@@ -217,6 +231,37 @@ static float studio_draw_accuracy[STUDIO_HISTORY_MAX];
 static cui_ctx *studio_ui(studio_state *state)
 {
   return state->ui;
+}
+
+/* The wasm shim backs clock_gettime() with performance.now(), so elapsed time
+ * and ETA work the same on the desktop and in the browser. */
+static double studio_now_seconds(void)
+{
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+    return 0.0;
+  }
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void studio_format_duration(char *buffer, size_t capacity,
+                                   double seconds)
+{
+  if (!(seconds >= 0.0) || !isfinite(seconds)) {
+    snprintf(buffer, capacity, "%s", "-");
+    return;
+  }
+  const unsigned total = (unsigned)(seconds + 0.5);
+  if (total >= 3600u) {
+    snprintf(buffer, capacity, "%uh %02um", total / 3600u,
+             (total % 3600u) / 60u);
+  } else if (total >= 60u) {
+    snprintf(buffer, capacity, "%um %02us", total / 60u, total % 60u);
+  } else if (total == 0u) {
+    snprintf(buffer, capacity, "<1s");
+  } else {
+    snprintf(buffer, capacity, "%us", total);
+  }
 }
 
 static const char *const studio_activation_labels[] = {
@@ -335,6 +380,7 @@ static void studio_clear_run_locked(studio_state *state)
   memset(&state->snap, 0, sizeof state->snap);
   state->history_count = 0;
   state->has_accuracy_history = false;
+  state->started_at = 0.0;
   state->finished = false;
 }
 
@@ -1326,6 +1372,25 @@ static void studio_progress(const elml_train_metrics *metrics, void *user)
   state->snap.val_rows = metrics->val_rows;
   state->snap.early_stopped = metrics->early_stopped;
   state->snap.stopped = metrics->stopped;
+
+  const double now = studio_now_seconds();
+  if (state->started_at <= 0.0) {
+    state->started_at = now;
+  }
+  const double elapsed = (now > state->started_at) ? now - state->started_at
+                                                   : 0.0;
+  state->snap.elapsed_seconds = elapsed;
+  state->snap.epochs_per_second = 0.0;
+  state->snap.eta_seconds = 0.0;
+  if (metrics->epoch > 0u && elapsed > 0.0) {
+    state->snap.epochs_per_second = (double)metrics->epoch / elapsed;
+    if (metrics->epochs > metrics->epoch) {
+      const double per_epoch = elapsed / (double)metrics->epoch;
+      state->snap.eta_seconds =
+          per_epoch * (double)(metrics->epochs - metrics->epoch);
+    }
+  }
+
   studio_history_append_locked(state, metrics);
   studio_unlock(state);
 }
@@ -1428,6 +1493,17 @@ static void studio_job_finish(studio_state *state, elml_training *training,
   state->snap.best_loss = training->best_loss;
   state->snap.epoch = training->epochs_done;
   state->snap.epochs = training->config.epochs;
+  state->snap.eta_seconds = 0.0;
+  if (state->started_at > 0.0) {
+    const double now = studio_now_seconds();
+    if (now >= state->started_at) {
+      state->snap.elapsed_seconds = now - state->started_at;
+      if (training->epochs_done > 0u && state->snap.elapsed_seconds > 0.0) {
+        state->snap.epochs_per_second =
+            (double)training->epochs_done / state->snap.elapsed_seconds;
+      }
+    }
+  }
   state->snap.has_accuracy = training->train.class_index != nullptr;
   state->snap.has_final_accuracy = training->has_final_accuracy;
   state->snap.final_train_loss = training->final_train_loss;
@@ -1448,9 +1524,10 @@ static void studio_job_finish(studio_state *state, elml_training *training,
   if (exported) {
     if (training->early_stopped) {
       snprintf(state->snap.status, sizeof state->snap.status,
-               "Early stopped at epoch %u (best epoch %u). Exported %s.",
-               training->epochs_done, training->best_epoch,
-               training->config.export_path);
+               "Early stopped at epoch %u: loss did not improve for %u "
+               "epochs (best epoch %u). Exported %s.",
+               training->epochs_done, training->config.early_stop,
+               training->best_epoch, training->config.export_path);
     } else if (training->stopped) {
       snprintf(state->snap.status, sizeof state->snap.status,
                "Stopped at epoch %u (best epoch %u). Exported %s.",
@@ -1500,22 +1577,32 @@ static void studio_web_pump(studio_state *state)
     return;
   }
 
-  elml_train_step step;
-  const elml_status status =
-      elml_training_step_epoch(&state->web_training, &step);
-  if (status != ELML_OK) {
-    studio_job_finish(state, &state->web_training, status);
-    elml_training_destroy(&state->web_training);
-    state->web_job_active = false;
-    return;
-  }
-  if (step.epoch_completed) {
-    studio_progress(&step.metrics, state);
-  }
-  if (step.done) {
-    studio_job_finish(state, &state->web_training, ELML_OK);
-    elml_training_destroy(&state->web_training);
-    state->web_job_active = false;
+  /* Run as many epochs as fit in a frame slice. Small datasets finish whole
+   * runs almost instantly instead of taking one frame per epoch, while a slow
+   * epoch still yields after at least one iteration so the page stays
+   * responsive. */
+  const double deadline = studio_now_seconds() + 0.008;
+  int epochs_this_frame = 0;
+  while (state->web_job_active && epochs_this_frame < 256 &&
+         (epochs_this_frame == 0 || studio_now_seconds() < deadline)) {
+    elml_train_step step;
+    const elml_status status =
+        elml_training_step_epoch(&state->web_training, &step);
+    if (status != ELML_OK) {
+      studio_job_finish(state, &state->web_training, status);
+      elml_training_destroy(&state->web_training);
+      state->web_job_active = false;
+      break;
+    }
+    if (step.epoch_completed) {
+      studio_progress(&step.metrics, state);
+    }
+    epochs_this_frame++;
+    if (step.done) {
+      studio_job_finish(state, &state->web_training, ELML_OK);
+      elml_training_destroy(&state->web_training);
+      state->web_job_active = false;
+    }
   }
   if (state->web_job_active) {
     cui_request_redraw(studio_ui(state));
@@ -1546,6 +1633,7 @@ static void studio_start(studio_state *state)
   studio_lock(state);
   studio_clear_run_locked(state);
   state->running = true;
+  state->started_at = studio_now_seconds();
   state->active = nullptr;
   snprintf(state->snap.status, sizeof state->snap.status, "%s",
            "Preparing data and network...");
@@ -1830,7 +1918,15 @@ static void studio_take_view(studio_state *state, studio_view *view)
   view->running = state->running;
   view->history_count = state->history_count;
   view->has_accuracy_history = state->has_accuracy_history;
-  if (view->history_count > 0) {
+  view->has_previous_metrics = state->history_count > 1;
+  if (state->history_count > 0) {
+    const int last = state->history_count - 1;
+    view->last_loss = state->loss_history[last];
+    view->last_accuracy = state->accuracy_history[last];
+    if (last > 0) {
+      view->previous_loss = state->loss_history[last - 1];
+      view->previous_accuracy = state->accuracy_history[last - 1];
+    }
     memcpy(studio_draw_loss, state->loss_history,
            (size_t)view->history_count * sizeof(float));
     memcpy(studio_draw_accuracy, state->accuracy_history,
@@ -1842,6 +1938,19 @@ static void studio_take_view(studio_state *state, studio_view *view)
     studio_draw_loss[1] = studio_draw_loss[0];
     studio_draw_accuracy[1] = studio_draw_accuracy[0];
     view->history_count = 2;
+  }
+
+  view->chart_count = view->history_count;
+  if (view->chart_count > STUDIO_CHART_MAX) {
+    const int raw_count = view->chart_count;
+    for (int i = 0; i < STUDIO_CHART_MAX; ++i) {
+      const int src =
+          (int)((long long)i * (long long)(raw_count - 1) /
+                (long long)(STUDIO_CHART_MAX - 1));
+      studio_draw_loss[i] = studio_draw_loss[src];
+      studio_draw_accuracy[i] = studio_draw_accuracy[src];
+    }
+    view->chart_count = STUDIO_CHART_MAX;
   }
 }
 
@@ -2346,10 +2455,9 @@ static void studio_metrics(cui_ctx *ui, const studio_view *view)
     snprintf(best_value, sizeof best_value, "%s", "-");
   }
 
-  if (view->history_count > 1) {
-    const int last = view->history_count - 1;
-    const float previous_loss = studio_draw_loss[last - 1];
-    const float current_loss = studio_draw_loss[last];
+  if (view->has_previous_metrics) {
+    const float previous_loss = view->previous_loss;
+    const float current_loss = view->last_loss;
     if (previous_loss > 0.0f) {
       loss_delta = (current_loss - previous_loss) / previous_loss * 100.0f;
       snprintf(loss_delta_label, sizeof loss_delta_label, "%+.1f%%",
@@ -2357,8 +2465,8 @@ static void studio_metrics(cui_ctx *ui, const studio_view *view)
       has_loss_delta = true;
     }
     if (view->has_accuracy_history) {
-      const float previous_accuracy = studio_draw_accuracy[last - 1];
-      const float current_accuracy = studio_draw_accuracy[last];
+      const float previous_accuracy = view->previous_accuracy;
+      const float current_accuracy = view->last_accuracy;
       accuracy_delta = (current_accuracy - previous_accuracy) * 100.0f;
       snprintf(accuracy_delta_label, sizeof accuracy_delta_label, "%+.2f pp",
                (double)accuracy_delta);
@@ -2366,16 +2474,17 @@ static void studio_metrics(cui_ctx *ui, const studio_view *view)
     }
   }
 
-  const int spark_count = view->history_count;
+  const int spark_count = view->chart_count;
   const float *loss_spark = (spark_count > 1) ? studio_draw_loss : nullptr;
   const float *accuracy_spark =
       (spark_count > 1 && view->has_accuracy_history) ? studio_draw_accuracy
                                                      : nullptr;
+  const char *loss_label = view->snap.has_val ? "Val loss" : "Train loss";
 
   cui_box(ui, .dir = CUI_GRID, .columns = 4, .min_column_width = 150,
           .gap = 12) {
     cui_metric(ui, "Epoch", epoch_value, .icon = CUI_ICON_ACTIVITY);
-    cui_metric(ui, "Val loss", loss_value,
+    cui_metric(ui, loss_label, loss_value,
                .icon = CUI_ICON_TRENDING_DOWN,
                .spark = loss_spark, .spark_count = spark_count,
                .lower_is_better = true,
@@ -2435,6 +2544,24 @@ static void studio_progress_card(cui_ctx *ui, const studio_view *view)
                      .height = 10.0f);
         if (view->snap.status[0] != '\0') {
           cui_secondary(ui, view->snap.status);
+        }
+        if (view->snap.epoch > 0u && view->snap.elapsed_seconds > 0.0) {
+          char elapsed[24];
+          char rate[48];
+          char eta[24];
+          char line[192];
+          studio_format_duration(elapsed, sizeof elapsed,
+                                 view->snap.elapsed_seconds);
+          snprintf(rate, sizeof rate, "%.2f epochs/s",
+                   view->snap.epochs_per_second);
+          if (view->running && view->snap.eta_seconds > 0.0) {
+            studio_format_duration(eta, sizeof eta, view->snap.eta_seconds);
+            snprintf(line, sizeof line, "Elapsed %s | %s | ETA %s", elapsed,
+                     rate, eta);
+          } else {
+            snprintf(line, sizeof line, "Elapsed %s | %s", elapsed, rate);
+          }
+          cui_muted(ui, line);
         }
       }
       if (view->snap.epochs > 0u) {
@@ -3306,16 +3433,16 @@ static void studio_training_view(cui_ctx *ui, studio_state *state,
     studio_metrics(ui, view);
     studio_progress_card(ui, view);
     studio_chart(ui, "Loss", "Monitored split loss after each epoch",
-                 "loss_chart", studio_draw_loss, view->history_count,
-                 "%.4f", view->history_count > 0,
+                 "loss_chart", studio_draw_loss, view->chart_count,
+                 "%.4f", view->chart_count > 0,
                  "The loss curve appears after the first epoch.");
     studio_chart(ui, "Accuracy",
                  view->snap.has_accuracy
                      ? "Share of correctly classified rows"
                      : "Reported for classification (cross-entropy) runs",
                  "accuracy_chart", studio_draw_accuracy,
-                 view->history_count, "%.3f",
-                 view->history_count > 0 && view->has_accuracy_history,
+                 view->chart_count, "%.3f",
+                 view->chart_count > 0 && view->has_accuracy_history,
                  view->snap.has_accuracy
                      ? "The accuracy curve appears after the first epoch."
                      : "Accuracy is only reported for classification runs.");

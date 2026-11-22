@@ -22,6 +22,15 @@ AR=${LLVM_AR:-llvm-ar}
 JOBS=${JOBS:-$(nproc)}
 SIMD=${ELML_WASM_SIMD:-1}
 
+# Keep scalar and SIMD objects apart: compile() only looks at timestamps, so a
+# shared directory would happily link stale -msimd128 objects into a scalar
+# build (or the reverse).
+if [[ "$SIMD" == "1" ]]; then
+    OBJ="$OUT/obj-simd"
+else
+    OBJ="$OUT/obj-scalar"
+fi
+
 if [[ ! -d "$CUI/web/shim/include" ]]; then
     echo "wasm/build.sh: CUI submodule missing; run: git submodule update --init" >&2
     exit 1
@@ -36,10 +45,13 @@ BASE_FLAGS=(--target=wasm32 -O2 -g0
             -ffile-prefix-map="$ROOT/"=
             -isystem "$CUI/web/shim/include")
 
-CUI_FLAGS=(-std=c99 -msimd128
+CUI_FLAGS=(-std=c99
            -Wno-unused-function -Wno-unused-variable
            -Wno-unused-but-set-variable -Wno-c11-extensions
            -I "$CUI/include" -I "$CUI/src")
+if [[ "$SIMD" == "1" ]]; then
+    CUI_FLAGS+=(-msimd128)
+fi
 
 ELML_WARNINGS=(-Wall -Wextra -Wpedantic -Wshadow -Wstrict-prototypes
                -Wmissing-prototypes -Wconversion -Wsign-conversion

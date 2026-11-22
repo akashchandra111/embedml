@@ -14,6 +14,7 @@
 #include "elml/compat.h"
 #include "elml/registry.h"
 #include "elml/types.h"
+#include "elml/version.h"
 
 #ifdef __cplusplus
 extern "C" {

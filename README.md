@@ -84,8 +84,20 @@ Useful options:
 | `ELML_BUILD_STUDIO` | `OFF` | Build the CUI desktop training studio |
 | `ELML_BUILD_WEB` | `OFF` | Build the WebAssembly studio and register its Node smoke test |
 | `ELML_CUI_SOURCE_DIR` | empty | Use a local CUI checkout instead of the `third_party/CUI` submodule |
-| `ELML_MAX_LAYERS` | `64` | Maximum layers per model |
-| `ELML_MAX_RANK` | `4` | Maximum tensor rank |
+| `ELML_SANITIZE` | `OFF` | Build everything with AddressSanitizer and UndefinedBehaviorSanitizer |
+
+`ELML_MAX_LAYERS` (64) and `ELML_MAX_RANK` (4) are fixed ABI constants in
+`include/elml/types.h`, not build options: public structs embed arrays of those
+sizes, so the library and its consumers must agree.
+
+For a sanitizer run, configure with `-DELML_SANITIZE=ON`; the flag reaches the
+library, tests, studio, and the iris/WDBC demo compiles:
+
+```sh
+cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug -DELML_SANITIZE=ON
+cmake --build build-san -j
+ctest --test-dir build-san --output-on-failure
+```
 
 For an MCU build, configure with `-DELML_TRAIN=OFF -DELML_BUILD_TESTS=OFF
 -DELML_BUILD_EXAMPLES=OFF` and link only `libelml_core`. Add
@@ -273,16 +285,16 @@ restored, and the exported `.elml` model lands in an in-memory file table
 entry, including predictions saved from the Evaluate tab.
 
 WebAssembly SIMD128 kernels are enabled by default (`src/kernels/wasm/`). Build
-the scalar path instead with:
+a completely scalar module, including the CUI frontend, with:
 
 ```sh
 ELML_WASM_SIMD=0 ./wasm/build.sh
 ```
 
 `wasm/test.mjs` is the Node smoke test: it loads the module, registers the iris
-sample, drives one frame per epoch, checks the export, and evaluates the model.
-It needs no browser and no test framework. `ELML_WEB_OUT` and `PORT` choose a
-different output directory or server port.
+sample, drives animation frames until training finishes, checks the export, and
+evaluates the model. It needs no browser and no test framework. `ELML_WEB_OUT`
+and `PORT` choose a different output directory or server port.
 
 ### Publishing to GitHub Pages
 
@@ -298,7 +310,7 @@ git push
 ```
 
 Then enable **Settings → Pages → Deploy from a branch**, branch `main`, folder
-`/docs`. Only the page assets and `samples/` are copied; `build-web/obj/` and
+`/docs`. Only the page assets and `samples/` are copied; `build-web/obj-*/` and
 `libcui.a` stay out. The script also writes `docs/.nojekyll` so the static files
 are served as-is. `ELML_PAGES_OUT` publishes somewhere else, and
 `ELML_WEB_OUT` chooses a different build directory.

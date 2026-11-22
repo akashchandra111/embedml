@@ -36,8 +36,11 @@ PY
 echo "single-row prediction passed"
 
 python3 embed_model.py iris.elml mcu/model_blob.h
-"$cc" -std=c23 -O2 -Wall -Wextra -Wpedantic -Werror \
+# CFLAGS/LDFLAGS let sanitizer or coverage builds instrument the MCU demo too.
+cflags=(${CFLAGS:--O2})
+ldflags=(${LDFLAGS:-})
+"$cc" -std=c23 "${cflags[@]}" -Wall -Wextra -Wpedantic -Werror \
   -I"$here/../../include" -I"$here/mcu" \
   mcu/main.c mcu/host_check.c "$build_dir/libelml_core.a" -lm \
-  -o mcu/host_check
+  "${ldflags[@]}" -o mcu/host_check
 ./mcu/host_check

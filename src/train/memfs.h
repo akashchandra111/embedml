@@ -6,6 +6,8 @@
  * path, and every trainer call that takes a path (config, CSV, model, export)
  * resolves against this table instead.
  *
+ * The table is portable and also built on the host so the unit tests can
+ * exercise it directly; only the wasm I/O layer actually routes paths here.
  * Paths are flat: a leading "/" and "./" segments are ignored, and "a//b" is
  * the same key as "a/b". That is enough for the studio, whose files all come
  * from a browser file picker and live side by side.

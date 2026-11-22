@@ -294,9 +294,10 @@ firmware.
 * `elml_model_init` copies descriptors into `elml_model` but does not copy the
   blob or the weights. The blob must stay alive for the model's lifetime.
 * `elml_model` itself is a few kilobytes because it contains
-  `ELML_MAX_LAYERS` descriptor and layer arrays. Reduce `ELML_MAX_LAYERS` at
-  compile time for a smaller footprint, as long as it stays large enough for
-  the model (iris needs 4).
+  `ELML_MAX_LAYERS` descriptor and layer arrays. That limit is a fixed ABI
+  constant (64), not a compiler flag: if you need a smaller footprint, edit it
+  in `include/elml/types.h` and rebuild the library and every consumer with the
+  same header. Iris needs only 4.
 * Scratch is two ping-pong activation buffers of the largest activation size,
   rounded up to 16 bytes. Iris needs 64 bytes; the demo reserves 1 KiB.
 * Inference performs no allocation, no file I/O, and no printing.

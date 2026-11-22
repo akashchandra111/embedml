@@ -1,7 +1,20 @@
 cmake_minimum_required(VERSION 3.25)
 
+# The version lives in the public header; parse it so CMake and the library
+# cannot disagree.
+set(ELML_VERSION_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/include/elml/version.h")
+file(READ "${ELML_VERSION_HEADER}" ELML_VERSION_TEXT)
+foreach(part MAJOR MINOR PATCH)
+  string(REGEX MATCH "#define ELML_VERSION_${part}[ \t]+([0-9]+)"
+         _version_match "${ELML_VERSION_TEXT}")
+  if(NOT _version_match)
+    message(FATAL_ERROR "${ELML_VERSION_HEADER}: missing ELML_VERSION_${part}")
+  endif()
+  set(ELML_VERSION_${part} "${CMAKE_MATCH_1}")
+endforeach()
+
 project(embedml
-  VERSION 0.1.0
+  VERSION ${ELML_VERSION_MAJOR}.${ELML_VERSION_MINOR}.${ELML_VERSION_PATCH}
   DESCRIPTION "Portable neural-network inference and training for embedded systems"
   LANGUAGES C)
 
@@ -17,10 +30,15 @@ option(ELML_SIMD "Use architecture-specific SIMD kernels when available" ON)
 option(ELML_STRICT_FP "Force the scalar f32 path for reproducible results" OFF)
 option(ELML_BUILD_STUDIO "Build the CUI training studio (uses the CUI submodule)" OFF)
 option(ELML_BUILD_WEB "Build the WebAssembly studio and run its Node smoke test" OFF)
+option(ELML_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 set(ELML_WEB_JOBS "" CACHE STRING "Parallel compile jobs for the wasm build (default: nproc)")
 set(ELML_CUI_SOURCE_DIR "" CACHE PATH "Local CUI checkout instead of the submodule (optional)")
-set(ELML_MAX_LAYERS "64" CACHE STRING "Maximum number of layers per model")
-set(ELML_MAX_RANK "4" CACHE STRING "Maximum tensor rank")
+
+set(ELML_SANITIZE_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer)
+if(ELML_SANITIZE)
+  add_compile_options(${ELML_SANITIZE_FLAGS})
+  add_link_options(${ELML_SANITIZE_FLAGS})
+endif()
 
 set(ELML_WARNINGS
   -Wall
@@ -76,9 +94,6 @@ if(ELML_SIMD_DEFINITIONS)
   target_compile_definitions(elml_core PRIVATE ${ELML_SIMD_DEFINITIONS})
 endif()
 target_link_libraries(elml_core PUBLIC m)
-target_compile_definitions(elml_core
-  PUBLIC ELML_MAX_LAYERS=${ELML_MAX_LAYERS}
-         ELML_MAX_RANK=${ELML_MAX_RANK})
 
 if(ELML_STRICT_FP)
   target_compile_definitions(elml_core PUBLIC ELML_STRICT_FP=1)
@@ -135,13 +150,22 @@ endif()
 
 if(ELML_BUILD_EXAMPLES AND ELML_BUILD_TESTS AND ELML_TRAIN)
   enable_testing()
+  set(ELML_EXAMPLE_ENV "CC=${CMAKE_C_COMPILER}")
+  if(ELML_SANITIZE)
+    string(JOIN " " ELML_SANITIZE_FLAGS_TEXT ${ELML_SANITIZE_FLAGS})
+    list(APPEND ELML_EXAMPLE_ENV
+      "CFLAGS=-O1 -g ${ELML_SANITIZE_FLAGS_TEXT}"
+      "LDFLAGS=${ELML_SANITIZE_FLAGS_TEXT}")
+  endif()
   add_test(NAME example_iris
-    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/examples/iris/run.sh
+    COMMAND ${CMAKE_COMMAND} -E env ${ELML_EXAMPLE_ENV}
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/iris/run.sh
             ${CMAKE_CURRENT_BINARY_DIR}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/examples/iris)
   set_tests_properties(example_iris PROPERTIES TIMEOUT 180)
   add_test(NAME example_wdbc
-    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/examples/wdbc/run.sh
+    COMMAND ${CMAKE_COMMAND} -E env ${ELML_EXAMPLE_ENV}
+            ${CMAKE_CURRENT_SOURCE_DIR}/examples/wdbc/run.sh
             ${CMAKE_CURRENT_BINARY_DIR}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/examples/wdbc)
   set_tests_properties(example_wdbc PROPERTIES TIMEOUT 180)

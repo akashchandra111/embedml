@@ -2,10 +2,10 @@
 //
 //   node wasm/test.mjs [build-web]
 //
-// Loads elml_studio.wasm, registers the iris sample, drives one frame per
-// epoch until training finishes, then evaluates the exported model. Exits
-// non-zero on the first failed assertion. No browser or test framework
-// needed; this is the same module the page loads.
+// Loads elml_studio.wasm, registers the iris sample, drives animation frames
+// until training finishes, then evaluates the exported model. Exits non-zero
+// on the first failed assertion. No browser or test framework needed; this is
+// the same module the page loads.
 
 import { readFileSync, existsSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';

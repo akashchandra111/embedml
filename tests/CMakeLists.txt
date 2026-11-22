@@ -21,6 +21,10 @@ elml_add_test(test_net)
 elml_add_test(test_io)
 elml_add_test(test_misc)
 elml_add_test(test_kernels)
+elml_add_test(test_memfs)
+elml_add_test(test_session)
+elml_add_test(test_export)
+elml_add_test(test_evaluate)
 
 add_test(NAME test_cli
   COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test_cli.sh

@@ -252,7 +252,8 @@ u8  value[value_len]
 ```
 
 Keys and values are UTF-8 byte strings and are not NUL-terminated in the file.
-The writer always emits `producer = "EmbedML 0.1.0"` and may emit:
+The writer always emits `producer = "EmbedML <version>"` (the version comes
+from `include/elml/version.h`) and may emit:
 
 | Key | Value |
 | --- | --- |
