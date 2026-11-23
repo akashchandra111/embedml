@@ -24,6 +24,8 @@ This is the v1 milestone. Implemented:
 * Configuration from CLI flags and INI files; CLI flags override INI values.
 * Regression (`mse`, `mae`) and classification (`cce`) training with Adam or
   SGD, L2 weight decay, early stopping, and best-weight restore.
+* Configurable multi-threaded training on native hosts (pthreads), with the
+  browser keeping its cooperative single-thread loop.
 * A no-malloc inference API, plus an inspect tool and a complete iris example
   with a bare-metal style demo.
 * SIMD kernels for x86_64 (AVX2/FMA, runtime-dispatched), arm64 (NEON), and
@@ -39,7 +41,6 @@ Not yet implemented, and explicitly rejected rather than silently ignored:
 
 * int8 training/quantization (`QNT` chunk is reserved; the runtime rejects it).
 * `CONV1D` (layer id reserved).
-* Multi-threaded training.
 * Non-sequential topologies.
 
 ## Repository layout
@@ -49,7 +50,7 @@ include/elml/        public headers (C11-compatible)
 src/core/            inference core: arena, registry, model, layers
 src/format/          on-disk parser, writer, CRC32, inspect helpers
 src/kernels/         common dispatch/scalar plus x86_64, arm64, and riscv kernels
-src/train/           host-only trainer: CSV, INI, config, dataset, net, session, export
+src/train/           host-only trainer: CSV, INI, config, dataset, net, threads, session, export
 src/studio/          optional CUI desktop frontend for the trainer
 wasm/                browser build: build script, page glue, Node smoke test
 src/run/             elml_run command-line inference/evaluation tool
@@ -64,7 +65,9 @@ docs/                format, code guide, coding style
 
 ## Build
 
-Requirements: a C23 compiler, CMake 3.25 or newer, and `make` or Ninja.
+Requirements: a C23 compiler, CMake 3.25 or newer, and `make` or Ninja. Native
+multi-threaded training uses the system pthreads; CMake finds them through
+`find_package(Threads)`.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -175,6 +178,29 @@ build/elml_train --csv data.csv --inputs x1,x2 --outputs y \
   --epochs 200 --batch 16 --lr 0.01 --export model.elml
 ```
 
+### Multi-threaded training
+
+Native builds use pthreads and accept `threads` under `[train]` or `--threads N`.
+The calling thread is one participant, so `threads = 4` runs four workers. Each
+worker owns private forward/backward scratch and gradient buffers; mini-batch
+gradients are reduced before the optimizer step, so the result matches the
+serial loop up to floating-point summation order. Each worker adds roughly one
+model-sized set of gradient and activation buffers, so very large models and
+many workers use noticeably more memory. Values above 64 are capped.
+
+```sh
+build/elml_train --config examples/covtype/covtype.ini --threads 8
+```
+
+On the 4-core / 8-thread development machine, the Covertype training phase
+roughly halves with `--threads 8`; CSV loading and the final evaluation remain
+serial.
+
+The browser build stays single-threaded. CUI's wasm shim has no
+`pthread_create`, and GitHub Pages cannot send the COOP/COEP headers required
+for `SharedArrayBuffer`, so the studio clamps `threads` to 1 and keeps the
+cooperative time-sliced loop described below.
+
 ## Training studio (CUI)
 
 `elml_studio` is an optional desktop frontend built on
@@ -278,11 +304,12 @@ inputs in the Files panel. Every Browse button inside the canvas asks the page
 for a file, so the browser's file picker replaces the native dialog.
 
 Training in the browser is cooperative: with no threads available, the studio
-runs **one epoch per animation frame** through `elml_training_step_epoch()`.
-Stop requests are still honoured at batch boundaries, the best epoch is
-restored, and the exported `.elml` model lands in an in-memory file table
-(`src/train/memfs.c`). The Files panel lists that table and can download any
-entry, including predictions saved from the Evaluate tab.
+runs **time-sliced epochs inside each animation frame** through
+`elml_training_step_epoch()` and clamps `threads` to 1. Stop requests are still
+honoured at batch boundaries, the best epoch is restored, and the exported
+`.elml` model lands in an in-memory file table (`src/train/memfs.c`). The Files
+panel lists that table and can download any entry, including predictions saved
+from the Evaluate tab.
 
 WebAssembly SIMD128 kernels are enabled by default (`src/kernels/wasm/`). Build
 a completely scalar module, including the CUI frontend, with:

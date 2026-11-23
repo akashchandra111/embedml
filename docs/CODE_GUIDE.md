@@ -28,7 +28,10 @@ Defines the project, options, warning set, and targets.
   `ELML_SIMD` and `CMAKE_SYSTEM_PROCESSOR`.
 * `elml_train_lib` (static library, host only): writer plus trainer support.
   Sources are `write.c`, `csv.c`, `ini.c`, `io.c`, `memfs.c`, `config.c`,
-  `dataset.c`, `net.c`, `evaluate.c`, `session.c`, `export.c`.
+  `dataset.c`, `net.c`, `threads.c`, `evaluate.c`, `session.c`, `export.c`.
+  When CMake finds pthreads it links `Threads::Threads` and defines
+  `ELML_HAVE_THREADS=1`; otherwise the pool and config compile to a serial
+  fallback.
 * `elml_inspect`: parses and prints a model without running it.
 * `elml_train`: the training executable.
 * `elml_run`: the inference/evaluation executable.
@@ -586,7 +589,9 @@ Configuration model and parser.
 * `elml_finalize_config(config)`: validates required fields, derives the
   classification flag from the loss, enforces the activation count
   (`hidden + 1`), requires softmax output for CCE and forbids softmax for
-  regression, validates ranges, and clamps `threads` to 1 with a warning.
+  regression, validates ranges, and normalizes `threads` (0 becomes 1, values
+  above `ELML_CONFIG_MAX_THREADS` are capped, and targets without threads are
+  clamped to 1).
 * `elml_config_load(config, argc, argv)`: initializes defaults, loads the INI
   file if `--config` is present, applies CLI overrides, and finalizes.
 * `elml_loss_name(loss)`, `elml_activation_name(activation)`: stable strings.
@@ -643,6 +648,13 @@ Host training network with forward/backward passes and optimizer state.
   moments, pre-activation/activation/delta buffers, and best-weight snapshots.
 * `elml_net`: layer array, loss, optimizer hyperparameters, Adam step counters,
   best-state flag, and input copy.
+* `elml_net_worker`: a per-thread training workspace that borrows the parent
+  net's weights, biases, Adam moments, and best snapshots but owns its own
+  input copy, activations, deltas, and gradients.
+* `elml_net_worker_init(worker, net)` / `elml_net_worker_free(worker)`:
+  allocate and release the private buffers without touching the parent net.
+* `elml_net_worker_reduce(worker, net)`: adds a worker's gradients into the
+  parent net before the optimizer step.
 * `elml_activate_value(act, value)`: scalar forward activation.
 * `elml_apply_softmax(z, out, count)`: stable softmax.
 * `elml_activation_derivative(layer, index)`: derivative from stored `z`/`a`;
@@ -700,26 +712,52 @@ Reusable host-only training session shared by the CLI and the studio.
   rows, monitored loss/accuracy, early-stop and stop flags).
 * `elml_train_progress_fn`: callback invoked once per completed epoch.
 * `elml_training`: owns the config, datasets, normalization, network, shuffle
-  order, best-weight bookkeeping, final metrics, error text, and an atomic stop
-  flag.
+  order, best-weight bookkeeping, final metrics, error text, an atomic stop
+  flag, and the optional native worker pool (`pool`, `workers`,
+  `worker_count`). `worker_count` includes the calling thread, so 1 means the
+  serial path.
 * `elml_training_init(training, config)`: loads the CSV(s), builds and splits
-  the datasets, computes normalization, creates the network, and allocates the
-  shuffle order. On failure it releases partial state and zeroes the struct.
+  the datasets, computes normalization, creates the network, allocates the
+  shuffle order, and starts `config.threads - 1` workers with private
+  `elml_net_worker` workspaces. If the pool or a workspace cannot be created it
+  keeps the prepared session and falls back to serial execution.
 * `elml_training_run(training, progress, user)`: loops over
   `elml_training_step_epoch` and invokes the progress callback for each
   completed epoch. Checks the atomic stop flag at batch boundaries, monitors
   validation loss, snapshots and restores the best weights, applies early
   stopping, and fills the final metrics.
-* `elml_training_step_epoch(training, step)`: cooperative variant for hosts
-  without worker threads (the browser). Runs at most one epoch, fills
-  `elml_train_step` with the same metrics, and finalizes the session on the
-  step that ends the run. `step.done` means no further epochs are available.
+* `elml_training_step_epoch(training, step)`: runs at most one epoch. In a
+  threaded session each mini-batch is split across the pool: every worker
+  accumulates into its own gradients, the caller reduces them into the network,
+  and only then does `elml_net_update` run. The cooperative browser host uses
+  the same function serially, fills `elml_train_step` with the metrics, and
+  finalizes on the step that ends the run. `step.done` means no further epochs
+  are available.
 * `elml_training_request_stop(training)`: safely requests a stop from another
-  thread; the loop exits at the next batch boundary.
+  thread; every worker checks the flag between samples.
 * `elml_training_export(training)`: exports the restored best weights.
 * `elml_training_destroy(training)`: releases resources in reverse allocation
-  order: training order, network, normalization, validation set, then training
-  set. Safe on partially initialized sessions.
+  order: workers, pool, shuffle order, network, normalization, validation set,
+  then training set. Safe on partially initialized sessions.
+
+### `threads.h` / `threads.c`
+
+Minimal pthread pool used by the native trainer.
+
+* `elml_parallel_fn(arg, worker)`: worker index 0 is the calling thread.
+* `elml_thread_pool_create(workers)`: starts `workers - 1` threads and waits
+  until they are parked. Returns `NULL` for `workers <= 1`, on non-pthread
+  targets, or if a thread cannot be created; callers then run serially.
+* `elml_thread_pool_run(pool, fn, arg)`: publishes one generation of work,
+  runs index 0 on the caller, and waits for the rest.
+* `elml_thread_pool_destroy(pool)`: signals shutdown and joins every worker.
+* `elml_thread_pool_workers(pool)`: effective participant count, or 1 for a
+  `NULL` pool.
+
+The wasm build compiles this file with `ELML_HAVE_THREADS` undefined, so the
+pool is a serial stub. That is intentional: CUI's wasm shim has no
+`pthread_create`, and the published page cannot use `SharedArrayBuffer` without
+COOP/COEP headers.
 
 ### `evaluate.h` / `evaluate.c`
 
@@ -934,10 +972,11 @@ manager.
 
 The browser has no threads, so the studio uses the cooperative
 `elml_training_step_epoch()` API and the `memfs` file table instead of stdio.
-Evaluation runs inline in the frame. `third_party/CUI`'s wasm shim provides
-libc, including its own allocator; its `pthread_create` always fails, its
-`fopen` returns `NULL`, and it has no `aligned_alloc`, which is why the trainer
-uses `elml_aligned_alloc` and the memfs branch.
+`config.c` clamps `threads` to 1 on this target, and the thread pool compiles to
+a serial stub. Evaluation runs inline in the frame. `third_party/CUI`'s wasm
+shim provides libc, including its own allocator; its `pthread_create` always
+fails, its `fopen` returns `NULL`, and it has no `aligned_alloc`, which is why
+the trainer uses `elml_aligned_alloc` and the memfs branch.
 
 ## 9. Runner (`src/run/`)
 
@@ -1104,8 +1143,15 @@ browser.
 Drives `elml_training_*` end to end: prepare a split dataset, step one epoch at
 a time, run to completion, export and reload the model, forward a row, verify
 stop-before-first-epoch and deterministic early stop, exercise the progress
-callback, use an explicit validation CSV, and check missing-data and null
-argument errors.
+callback, use an explicit validation CSV, run with a four-worker pool, and check
+missing-data and null argument errors.
+
+### `test_threads.c`
+
+Checks the pthread pool (four participants, worker indices, reuse, serial
+fallback) and the per-worker training workspace: a worker must reproduce the
+same single-sample gradient, and reducing it must add to the caller's
+accumulation rather than replace it.
 
 ### `test_export.c`
 

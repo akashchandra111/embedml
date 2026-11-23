@@ -1,8 +1,9 @@
 // The browser front end for the embedml studio wasm module.
 //
 // CUI draws the studio into a software surface; this file copies that surface
-// to a canvas and forwards mouse, wheel and keyboard input. Training runs one
-// epoch per animation frame, so the page stays responsive without threads.
+// to a canvas and forwards mouse, wheel and keyboard input. Training runs
+// time-sliced epochs inside each animation frame, so the page stays responsive
+// without threads.
 
 import { loadStudio } from './loader.js';
 

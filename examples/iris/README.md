@@ -338,6 +338,8 @@ it exists only for verification.
 * int8 quantization: the format reserves a `QNT` chunk, but the quantizer and
   int8 runtime are not part of this milestone.
 * Convolutional layers and non-sequential topologies.
-* SIMD and multi-threaded training: `threads` currently clamps to 1.
+* SIMD and multi-threaded training details: SIMD is covered by the kernel
+  tests; `threads` works on native builds and is clamped to 1 in the browser.
+  Iris is too small to benefit from extra workers.
 
 See `docs/FORMAT.md` and `docs/CODE_GUIDE.md` for the full format and code map.

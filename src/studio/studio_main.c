@@ -147,7 +147,7 @@ typedef struct studio_state {
 #endif
   bool worker_started;
 
-  /* Cooperative training job (wasm only): one epoch per frame. */
+  /* Cooperative training job (wasm only): time-sliced epochs per frame. */
   elml_training web_training;
   bool web_job_active;
 
@@ -187,6 +187,7 @@ typedef struct studio_state {
   double learning_rate;
   double l2;
   double early_stop;
+  double threads;
 
   /* Tabs: 0 trains, 1 evaluates a saved model against a CSV. */
   int tab;
@@ -400,6 +401,7 @@ static void studio_defaults(studio_state *state)
   state->learning_rate = 0.001;
   state->l2 = 0.0;
   state->early_stop = 20.0;
+  state->threads = 1.0;
   state->eval_has_header = true;
   state->eval_score = true;
   state->eval_display_limit = 500u;
@@ -1046,6 +1048,7 @@ static void studio_apply_config(studio_state *state, const elml_config *config)
   state->learning_rate = config->learning_rate;
   state->l2 = config->l2;
   state->early_stop = (double)config->early_stop;
+  state->threads = (double)config->threads;
 
   size_t used = 0u;
   state->layers[0] = '\0';
@@ -1265,6 +1268,7 @@ static bool studio_build_config(studio_state *state, elml_config *config,
   char learning_rate_text[64];
   char l2_text[64];
   char early_stop_text[32];
+  char threads_text[32];
   char missing_text[16];
   char loss_text[16];
   char optimizer_text[16];
@@ -1285,6 +1289,8 @@ static bool studio_build_config(studio_state *state, elml_config *config,
   snprintf(l2_text, sizeof l2_text, "%.12g", state->l2);
   snprintf(early_stop_text, sizeof early_stop_text, "%u",
            (unsigned)(state->early_stop < 0.0 ? 0.0 : state->early_stop));
+  snprintf(threads_text, sizeof threads_text, "%u",
+           (unsigned)(state->threads < 1.0 ? 1.0 : state->threads));
 
   char *argv[STUDIO_ARG_MAX];
   int argc = 0;
@@ -1326,6 +1332,8 @@ static bool studio_build_config(studio_state *state, elml_config *config,
   argv[argc++] = l2_text;
   argv[argc++] = "--early-stop";
   argv[argc++] = early_stop_text;
+  argv[argc++] = "--threads";
+  argv[argc++] = threads_text;
   argv[argc++] = "--export";
   argv[argc++] = state->export_path;
 
@@ -1645,7 +1653,7 @@ static void studio_start(studio_state *state)
   cui_request_redraw(studio_ui(state));
 
 #if defined(ELML_WASM)
-  /* No threads in the browser: prepare here and run one epoch per frame in
+  /* No threads in the browser: prepare here and run time-sliced epochs in
    * studio_web_pump(), which the page's frame callback drives. */
   if (!studio_job_prepare(state, &state->web_training)) {
     return; /* prepare published the error and cleared the running flag */
@@ -2362,12 +2370,19 @@ static bool studio_sidebar(cui_ctx *ui, studio_state *state, bool running)
                             0.0001, 7, nullptr, nullptr,
                             "Weight decay strength. 0 disables it.", running);
       }
-      studio_number_field(ui, "early_stop", "Early-stop patience",
-                          &state->early_stop, 0.0, 1000000.0, 5.0, 0,
-                          "epochs", "0 disables early stopping.",
-                          "Stop after this many epochs without validation "
-                          "loss improvement. 0 disables early stopping.",
-                          running);
+      cui_row(ui, .width = CUI_FILL, .gap = 12) {
+        studio_number_field(ui, "early_stop", "Early-stop patience",
+                            &state->early_stop, 0.0, 1000000.0, 5.0, 0,
+                            "epochs", "0 disables early stopping.",
+                            "Stop after this many epochs without validation "
+                            "loss improvement. 0 disables early stopping.",
+                            running);
+        studio_number_field(ui, "threads", "Threads", &state->threads, 1.0,
+                            64.0, 1.0, 0, nullptr, nullptr,
+                            "Native worker threads. 1 disables threading. The "
+                            "browser always runs one cooperative thread.",
+                            running);
+      }
 
       studio_section(ui, "EXPORT");
       studio_path_field(ui, state, "export_path", "Model output",

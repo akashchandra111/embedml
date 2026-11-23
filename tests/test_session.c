@@ -224,6 +224,40 @@ static void test_run_callback(const char *csv_path, const char *export_path)
   elml_training_destroy(&training);
 }
 
+static void test_threaded_run(const char *csv_path, const char *export_path)
+{
+  elml_config config = make_config(csv_path, export_path);
+  config.epochs = 40u;
+  config.threads = 4u;
+
+  elml_training training;
+  CHECK_EQ_INT(elml_training_init(&training, &config), ELML_OK);
+#if defined(ELML_HAVE_THREADS)
+  CHECK_EQ_INT(training.worker_count, 4u);
+#else
+  CHECK_EQ_INT(training.worker_count, 1u);
+#endif
+  CHECK_EQ_INT(training.config.threads, training.worker_count);
+  CHECK_EQ_INT(elml_training_run(&training, NULL, NULL), ELML_OK);
+  CHECK_EQ_INT(training.epochs_done, 40u);
+  CHECK(training.ran);
+  CHECK(isfinite((double)training.final_train_loss));
+  CHECK(isfinite((double)training.final_val_loss));
+  elml_training_destroy(&training);
+
+  /* A stop request before the first batch must still finalize cleanly with
+   * the worker pool alive. */
+  config.epochs = 1000u;
+  CHECK_EQ_INT(elml_training_init(&training, &config), ELML_OK);
+  elml_training_request_stop(&training);
+  elml_train_step step;
+  CHECK_EQ_INT(elml_training_step_epoch(&training, &step), ELML_OK);
+  CHECK(step.done);
+  CHECK(!step.epoch_completed);
+  CHECK(training.stopped);
+  elml_training_destroy(&training);
+}
+
 static void test_validation_file(const char *csv_path, const char *val_path,
                                  const char *export_path)
 {
@@ -271,6 +305,7 @@ int main(void)
     test_early_stop(csv_path, export_path);
     test_run_callback(csv_path, export_path);
     test_validation_file(csv_path, val_path, export_path);
+    test_threaded_run(csv_path, export_path);
   }
 
   /* Missing data reports a message and leaves the session unusable. */

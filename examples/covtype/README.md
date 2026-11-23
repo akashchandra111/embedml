@@ -30,6 +30,11 @@ Measured on this machine (x86_64, SIMD build, single thread):
 | Full evaluation | ~3 s |
 | 10,000 REPL predictions | ~61 ms (~164k predictions/s) |
 
+The training phase is CPU-bound. Pass `--threads N` (or set `threads` in
+`covtype.ini`) to split each mini-batch across native workers; on the 4-core /
+8-thread machine used for the table, `--threads 8` roughly halves the per-epoch
+training time. Loading the 72 MB CSV and the final evaluation stay serial.
+
 The scalar and strict-FP builds produce the same accuracy; a single row on the
 decision boundary can flip because of floating-point ordering.
 

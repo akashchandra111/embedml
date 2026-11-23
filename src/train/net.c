@@ -218,6 +218,93 @@ void elml_net_free(elml_net *net)
   memset(net, 0, sizeof *net);
 }
 
+void elml_net_worker_free(elml_net_worker *worker)
+{
+  if (worker == nullptr) {
+    return;
+  }
+  /* Only the private buffers are owned here; weights and optimizer state are
+   * borrowed from the parent net. */
+  for (uint32_t l = 0u; l < worker->net.layer_count; ++l) {
+    elml_net_layer *layer = &worker->net.layers[l];
+    free(layer->z);
+    free(layer->a);
+    free(layer->delta);
+    free(layer->grad_w);
+    free(layer->grad_b);
+  }
+  free(worker->net.input_copy);
+  memset(worker, 0, sizeof *worker);
+}
+
+elml_status elml_net_worker_init(elml_net_worker *worker, const elml_net *net)
+{
+  if (worker == nullptr || net == nullptr || net->layer_count == 0u ||
+      net->input_dim == 0u) {
+    return ELML_ERR_INVALID_ARG;
+  }
+
+  memset(worker, 0, sizeof *worker);
+  worker->net = *net;
+
+  /* Drop every pointer that this worker does not own before allocating, so a
+   * partial failure can be cleaned up without touching the parent net. */
+  worker->net.input_copy = nullptr;
+  for (uint32_t l = 0u; l < net->layer_count; ++l) {
+    elml_net_layer *layer = &worker->net.layers[l];
+    layer->z = nullptr;
+    layer->a = nullptr;
+    layer->delta = nullptr;
+    layer->grad_w = nullptr;
+    layer->grad_b = nullptr;
+  }
+
+  worker->net.input_copy = elml_alloc_floats((size_t)net->input_dim);
+  if (worker->net.input_copy == nullptr) {
+    elml_net_worker_free(worker);
+    return ELML_ERR_OUT_OF_MEMORY;
+  }
+
+  for (uint32_t l = 0u; l < net->layer_count; ++l) {
+    elml_net_layer *layer = &worker->net.layers[l];
+    const size_t weight_count = (size_t)layer->in_dim * (size_t)layer->out_dim;
+    const size_t bias_count = (size_t)layer->out_dim;
+
+    layer->z = elml_alloc_floats(bias_count);
+    layer->a = elml_alloc_floats(bias_count);
+    layer->delta = elml_alloc_floats(bias_count);
+    layer->grad_w = elml_alloc_floats(weight_count);
+    layer->grad_b = elml_alloc_floats(bias_count);
+
+    if (layer->z == nullptr || layer->a == nullptr || layer->delta == nullptr ||
+        layer->grad_w == nullptr || layer->grad_b == nullptr) {
+      elml_net_worker_free(worker);
+      return ELML_ERR_OUT_OF_MEMORY;
+    }
+  }
+  return ELML_OK;
+}
+
+void elml_net_worker_reduce(const elml_net_worker *worker, elml_net *net)
+{
+  if (worker == nullptr || net == nullptr ||
+      worker->net.layer_count != net->layer_count) {
+    return;
+  }
+  for (uint32_t l = 0u; l < net->layer_count; ++l) {
+    const elml_net_layer *source = &worker->net.layers[l];
+    elml_net_layer *target = &net->layers[l];
+    const size_t weight_count =
+        (size_t)target->in_dim * (size_t)target->out_dim;
+    for (size_t i = 0u; i < weight_count; ++i) {
+      target->grad_w[i] += source->grad_w[i];
+    }
+    for (uint32_t i = 0u; i < target->out_dim; ++i) {
+      target->grad_b[i] += source->grad_b[i];
+    }
+  }
+}
+
 elml_status elml_net_forward(elml_net *net, const float *input, float *output)
 {
   if (net == nullptr || input == nullptr) {

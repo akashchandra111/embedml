@@ -50,7 +50,19 @@ void elml_training_destroy(elml_training *training)
   if (training == nullptr) {
     return;
   }
-  /* Reverse allocation order: order, net, norm, validation, training. */
+  /* Reverse allocation order: workers, order, net, norm, validation,
+   * training. Worker workspaces borrow the net's weights, so they go first. */
+  if (training->worker_count > 1u) {
+    for (uint32_t i = 0u; i + 1u < training->worker_count; ++i) {
+      elml_net_worker_free(&training->workers[i]);
+    }
+  }
+  free(training->workers);
+  training->workers = nullptr;
+  elml_thread_pool_destroy(training->pool);
+  training->pool = nullptr;
+  training->worker_count = 0u;
+
   free(training->order);
   training->order = nullptr;
   elml_net_free(&training->net);
@@ -170,6 +182,47 @@ elml_status elml_training_init(elml_training *training,
     training->order[i] = i;
   }
 
+  /* Threading is an optimization: if the pool or a workspace cannot be
+   * created, keep the prepared session and fall back to the serial loop. */
+  training->worker_count = 1u;
+  if (config->threads > 1u) {
+    elml_thread_pool *pool = elml_thread_pool_create(config->threads);
+    if (pool != nullptr) {
+      const uint32_t workers = elml_thread_pool_workers(pool);
+      elml_net_worker *workspaces = (elml_net_worker *)calloc(
+          (size_t)(workers - 1u), sizeof *workspaces);
+      if (workspaces != nullptr) {
+        uint32_t ready = 0u;
+        elml_status worker_status = ELML_OK;
+        for (uint32_t i = 0u; i + 1u < workers; ++i) {
+          worker_status = elml_net_worker_init(&workspaces[i], &training->net);
+          if (worker_status != ELML_OK) {
+            break;
+          }
+          ready++;
+        }
+        if (worker_status == ELML_OK) {
+          training->pool = pool;
+          training->workers = workspaces;
+          training->worker_count = workers;
+          training->config.threads = workers;
+          pool = nullptr;
+          workspaces = nullptr;
+        } else {
+          for (uint32_t i = 0u; i < ready; ++i) {
+            elml_net_worker_free(&workspaces[i]);
+          }
+        }
+      }
+      free(workspaces);
+      elml_thread_pool_destroy(pool);
+    }
+    if (training->worker_count == 1u) {
+      fprintf(stderr, "embedml: cannot start %u training threads; using 1\n",
+              (unsigned)config->threads);
+    }
+  }
+
   training->prepared = true;
   return ELML_OK;
 
@@ -216,6 +269,63 @@ static void elml_training_finalize(elml_training *training)
   }
 }
 
+typedef struct elml_batch_job {
+  elml_training *training;
+  uint32_t start;
+  uint32_t count;
+  uint32_t workers;
+  atomic_bool aborted;
+  atomic_int status;
+} elml_batch_job;
+
+static void elml_batch_range(uint32_t count, uint32_t workers, uint32_t worker,
+                             uint32_t *begin, uint32_t *end)
+{
+  const uint32_t base = count / workers;
+  const uint32_t extra = count % workers;
+  const uint32_t offset =
+      worker * base + ((worker < extra) ? worker : extra);
+  *begin = offset;
+  *end = offset + base + ((worker < extra) ? 1u : 0u);
+}
+
+static void elml_train_batch_worker(void *opaque, uint32_t worker)
+{
+  elml_batch_job *job = (elml_batch_job *)opaque;
+  elml_training *training = job->training;
+  elml_net *net = (worker == 0u)
+                      ? &training->net
+                      : &training->workers[worker - 1u].net;
+
+  elml_net_zero_grad(net);
+
+  uint32_t begin = 0u;
+  uint32_t end = 0u;
+  elml_batch_range(job->count, job->workers, worker, &begin, &end);
+  for (uint32_t k = begin; k < end; ++k) {
+    if (atomic_load_explicit(&training->stop_requested,
+                             memory_order_relaxed)) {
+      atomic_store_explicit(&job->aborted, true, memory_order_relaxed);
+      return;
+    }
+    const uint32_t row = training->order[job->start + k];
+    const float *input =
+        &training->train.x[(size_t)row * training->train.input_dim];
+    const float *target =
+        &training->train.y[(size_t)row * training->train.output_dim];
+    const uint32_t class_index =
+        (training->train.class_index != nullptr)
+            ? training->train.class_index[row]
+            : 0u;
+    const elml_status status =
+        elml_net_accumulate(net, input, target, class_index);
+    if (status != ELML_OK) {
+      atomic_store_explicit(&job->status, (int)status, memory_order_relaxed);
+      return;
+    }
+  }
+}
+
 elml_status elml_training_step_epoch(elml_training *training,
                                      elml_train_step *step)
 {
@@ -251,27 +361,53 @@ elml_status elml_training_step_epoch(elml_training *training,
     if (count > training->train.rows - start) {
       count = training->train.rows - start;
     }
-    elml_net_zero_grad(&training->net);
-    for (uint32_t k = 0u; k < count; ++k) {
-      if (atomic_load(&training->stop_requested)) {
-        aborted = true;
-        break;
-      }
-      const uint32_t row = training->order[start + k];
-      const float *input =
-          &training->train.x[(size_t)row * training->train.input_dim];
-      const float *target =
-          &training->train.y[(size_t)row * training->train.output_dim];
-      const uint32_t class_index =
-          (training->train.class_index != nullptr)
-              ? training->train.class_index[row]
-              : 0u;
-      const elml_status status = elml_net_accumulate(
-          &training->net, input, target, class_index);
-      if (status != ELML_OK) {
+    if (training->worker_count > 1u) {
+      elml_batch_job job;
+      job.training = training;
+      job.start = start;
+      job.count = count;
+      job.workers = training->worker_count;
+      atomic_init(&job.aborted, false);
+      atomic_init(&job.status, (int)ELML_OK);
+
+      elml_thread_pool_run(training->pool, elml_train_batch_worker, &job);
+
+      aborted = atomic_load_explicit(&job.aborted, memory_order_relaxed);
+      const elml_status batch_status =
+          (elml_status)atomic_load_explicit(&job.status, memory_order_relaxed);
+      if (batch_status != ELML_OK) {
         elml_training_error(training, "training failed: %s",
-                            elml_error_string(status));
-        return status;
+                            elml_error_string(batch_status));
+        return batch_status;
+      }
+      if (!aborted) {
+        for (uint32_t w = 0u; w + 1u < training->worker_count; ++w) {
+          elml_net_worker_reduce(&training->workers[w], &training->net);
+        }
+      }
+    } else {
+      elml_net_zero_grad(&training->net);
+      for (uint32_t k = 0u; k < count; ++k) {
+        if (atomic_load(&training->stop_requested)) {
+          aborted = true;
+          break;
+        }
+        const uint32_t row = training->order[start + k];
+        const float *input =
+            &training->train.x[(size_t)row * training->train.input_dim];
+        const float *target =
+            &training->train.y[(size_t)row * training->train.output_dim];
+        const uint32_t class_index =
+            (training->train.class_index != nullptr)
+                ? training->train.class_index[row]
+                : 0u;
+        const elml_status status = elml_net_accumulate(
+            &training->net, input, target, class_index);
+        if (status != ELML_OK) {
+          elml_training_error(training, "training failed: %s",
+                              elml_error_string(status));
+          return status;
+        }
       }
     }
     if (aborted) {

@@ -124,6 +124,7 @@ APP_SRCS=(
     src/train/config.c
     src/train/dataset.c
     src/train/net.c
+    src/train/threads.c
     src/train/evaluate.c
     src/train/session.c
     src/train/export.c

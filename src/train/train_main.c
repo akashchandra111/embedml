@@ -122,6 +122,9 @@ int main(int argc, char **argv)
   printf("embedml: %u train / %u validation rows, %u -> %u\n",
          training.train.rows, training.val.rows, training.train.input_dim,
          training.train.output_dim);
+  if (training.worker_count > 1u) {
+    printf("embedml: %u training threads\n", training.worker_count);
+  }
   printf("embedml: layers");
   for (uint32_t i = 0u; i < training.net.layer_count; ++i) {
     printf(" %u", training.net.layers[i].out_dim);

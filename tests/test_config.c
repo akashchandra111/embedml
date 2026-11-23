@@ -75,10 +75,32 @@ int main(void)
     CHECK_EQ_INT(config.loss, ELML_LOSS_MSE);
     CHECK_EQ_INT(config.epochs, 9u);
     CHECK_EQ_INT(config.batch, 2u);
+#if defined(ELML_HAVE_THREADS)
+    CHECK_EQ_INT(config.threads, 2u);
+#else
     CHECK_EQ_INT(config.threads, 1u);
+#endif
     CHECK(!config.has_header);
     CHECK_CLOSE(config.split, 0.7, 1e-9);
     CHECK_CLOSE(config.learning_rate, 0.01, 1e-9);
+  }
+
+  {
+    char *argv[] = {"elml_train", "--config", ini_path, "--threads", "999"};
+    elml_config config;
+    CHECK_EQ_INT(load(argv, 5, &config), ELML_OK);
+#if defined(ELML_HAVE_THREADS)
+    CHECK_EQ_INT(config.threads, ELML_CONFIG_MAX_THREADS);
+#else
+    CHECK_EQ_INT(config.threads, 1u);
+#endif
+  }
+
+  {
+    char *argv[] = {"elml_train", "--config", ini_path, "--threads", "0"};
+    elml_config config;
+    CHECK_EQ_INT(load(argv, 5, &config), ELML_OK);
+    CHECK_EQ_INT(config.threads, 1u);
   }
 
   {

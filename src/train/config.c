@@ -615,11 +615,17 @@ static elml_status elml_finalize_config(elml_config *config)
   if (config->threads == 0u) {
     config->threads = 1u;
   }
-  if (config->threads > 1u) {
-    fprintf(stderr,
-            "config: threads > 1 is reserved for a later milestone; using 1\n");
-    config->threads = 1u;
+  if (config->threads > ELML_CONFIG_MAX_THREADS) {
+    fprintf(stderr, "config: threads capped at %u\n",
+            (unsigned)ELML_CONFIG_MAX_THREADS);
+    config->threads = ELML_CONFIG_MAX_THREADS;
   }
+#if !defined(ELML_HAVE_THREADS)
+  /* Cooperative hosts (the browser) have no worker threads. The session also
+   * falls back to serial execution, so clamp here without alarming the user
+   * when a shared .ini still says threads = 4. */
+  config->threads = 1u;
+#endif
   if (config->l2 < 0.0) {
     fprintf(stderr, "config: l2 must be non-negative\n");
     return ELML_ERR_INVALID_ARG;
@@ -728,7 +734,7 @@ void elml_config_print_help(void)
          "  --lr R                default 0.001\n"
          "  --l2 R                L2 weight decay\n"
          "  --early-stop N        default 20 epochs\n"
-         "  --threads N           worker count (1 in this milestone)\n"
+         "  --threads N           worker count, 1 disables threading\n"
          "\n"
          "export:\n"
          "  --export FILE         output .elml path\n");

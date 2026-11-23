@@ -107,6 +107,13 @@ target_include_directories(elml_inspect PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(elml_inspect PRIVATE ${ELML_WARNINGS})
 
 if(ELML_TRAIN)
+  find_package(Threads)
+  if(Threads_FOUND AND CMAKE_USE_PTHREADS_INIT)
+    set(ELML_THREADS_ENABLED ON)
+  else()
+    set(ELML_THREADS_ENABLED OFF)
+  endif()
+
   add_library(elml_train_lib STATIC
     src/format/write.c
     src/train/csv.c
@@ -116,6 +123,7 @@ if(ELML_TRAIN)
     src/train/config.c
     src/train/dataset.c
     src/train/net.c
+    src/train/threads.c
     src/train/evaluate.c
     src/train/session.c
     src/train/export.c)
@@ -125,6 +133,10 @@ if(ELML_TRAIN)
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_compile_options(elml_train_lib PRIVATE ${ELML_WARNINGS})
+  if(ELML_THREADS_ENABLED)
+    target_link_libraries(elml_train_lib PRIVATE Threads::Threads)
+    target_compile_definitions(elml_train_lib PRIVATE ELML_HAVE_THREADS=1)
+  endif()
 
   add_executable(elml_train src/train/train_main.c)
   target_link_libraries(elml_train PRIVATE elml_train_lib)

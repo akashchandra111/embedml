@@ -63,6 +63,25 @@ typedef struct elml_net {
   float *input_copy;
 } elml_net;
 
+/*
+ * Per-thread training workspace.
+ *
+ * A worker shares the weights, biases, optimizer moments, and best-weight
+ * snapshots with the owning net, but owns its own forward/backward scratch and
+ * gradient buffers. Accumulating a mini-batch in parallel is therefore a
+ * matter of running each worker over a slice of the batch and summing the
+ * private gradients afterwards.
+ */
+typedef struct elml_net_worker {
+  elml_net net;
+} elml_net_worker;
+
+elml_status elml_net_worker_init(elml_net_worker *worker, const elml_net *net);
+void elml_net_worker_free(elml_net_worker *worker);
+
+/* net->grad_w/grad_b += worker->net.grad_w/grad_b. */
+void elml_net_worker_reduce(const elml_net_worker *worker, elml_net *net);
+
 elml_status elml_net_create(elml_net *net, const uint32_t *hidden,
                             uint32_t hidden_count,
                             const elml_activation *activations,

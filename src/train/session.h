@@ -20,6 +20,7 @@
 #include "train/config.h"
 #include "train/dataset.h"
 #include "train/net.h"
+#include "train/threads.h"
 
 typedef struct elml_train_metrics {
   uint32_t epoch;      /* epoch that just finished */
@@ -48,6 +49,12 @@ typedef struct elml_training {
   elml_norm_stats norm;
   elml_net net;
   uint32_t *order;
+
+  /* Native training threads. worker_count includes the calling thread, so a
+   * serial session has worker_count == 1 and no pool or workspaces. */
+  elml_thread_pool *pool;
+  elml_net_worker *workers; /* worker_count - 1 entries */
+  uint32_t worker_count;
 
   uint64_t rng_state;
   float best_loss;
